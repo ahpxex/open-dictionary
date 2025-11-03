@@ -119,7 +119,7 @@ def enrich_definitions(
                     target_column,
                 ),
                 where=where_clause,
-                order_by=("id",),
+                order_by=("common_score",),
             )
 
             for row in row_stream:
