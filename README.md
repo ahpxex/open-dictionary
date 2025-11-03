@@ -94,7 +94,7 @@ _Optionally convert to TOON format (reduces token usage by 30-60% for LLM workfl
 uv run open-dictionary pre-process \
   --table dictionary_filtered_en \
   --source-column data \
-  --target-column processed
+  --target-column processed \
   --toon
 ```
 
