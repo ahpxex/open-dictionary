@@ -29,7 +29,7 @@ DEFAULT_PROGRESS_EVERY_SECONDS = 30.0
 @dataclass(frozen=True)
 class RowPayload:
     row_id: int
-    payload: dict[str, Any]
+    payload: str
 
 
 def enrich_definitions(
@@ -246,7 +246,7 @@ def _run_llm_batch(
 
 
 def _define_with_retry(
-    payload: dict[str, Any],
+    payload: str,
     max_retries: int,
     initial_backoff_seconds: float,
     max_backoff_seconds: float,
@@ -323,27 +323,21 @@ def _ensure_target_column(
         conn.commit()
 
 
-def _load_payload(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, dict):
+def _load_payload(value: Any) -> str | None:
+    if isinstance(value, str):
         return value
     if value is None:
         return None
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, bytes):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return None
-        return _load_payload(decoded)
+        return decoded
     if isinstance(value, memoryview):
         return _load_payload(value.tobytes())
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(decoded, dict):
-            return decoded
-        return None
     return None
 
 
