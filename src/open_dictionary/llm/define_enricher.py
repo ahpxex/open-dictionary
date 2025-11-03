@@ -142,7 +142,9 @@ def enrich_definitions(
                     emit_progress(force=True)
                     continue
 
-                pending_rows.append(RowPayload(int(row_id), payload))
+                sanitized_payload = _sanitize_payload(payload)
+
+                pending_rows.append(RowPayload(int(row_id), sanitized_payload))
 
                 if len(pending_rows) >= llm_batch_size:
                     _process_batch(
@@ -340,6 +342,31 @@ def _load_payload(value: Any) -> str | None:
     if isinstance(value, memoryview):
         return _load_payload(value.tobytes())
     return None
+
+
+def _sanitize_payload(payload: str, max_length: int = 1000) -> str:
+    """Trim overly large payloads by dropping noisy fields."""
+    if len(payload) <= max_length:
+        return payload
+
+    try:
+        payload_obj = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        return payload
+
+    if isinstance(payload_obj, dict):
+        for key in ("derived", "forms", "glosses"):
+            payload_obj.pop(key, None)
+
+        senses = payload_obj.get("senses")
+        if isinstance(senses, list):
+            for sense in senses:
+                if isinstance(sense, dict):
+                    sense.pop("glosses", None)
+
+        return json.dumps(payload_obj, ensure_ascii=False)
+
+    return payload
 
 
 def _report_progress(
