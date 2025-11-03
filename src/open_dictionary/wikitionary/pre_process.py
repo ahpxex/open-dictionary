@@ -9,6 +9,11 @@ from psycopg.cursor import Cursor
 
 from open_dictionary.db.access import DatabaseAccess
 
+try:
+    from toon import encode as toon_encode
+except ImportError:
+    toon_encode = None
+
 FETCH_BATCH_SIZE = 5000
 UPDATE_BATCH_SIZE = 5000
 PROGRESS_EVERY_ROWS = 20_000
@@ -34,6 +39,7 @@ def preprocess_entries(
     progress_every_rows: int = PROGRESS_EVERY_ROWS,
     progress_every_seconds: float = PROGRESS_EVERY_SECONDS,
     recompute_existing: bool = False,
+    use_toon: bool = False,
 ) -> None:
     """Normalize Wiktionary payloads into a slimmer JSONB column."""
 
@@ -41,9 +47,11 @@ def preprocess_entries(
         raise ValueError("fetch_batch_size must be positive")
     if update_batch_size <= 0:
         raise ValueError("update_batch_size must be positive")
+    if use_toon and toon_encode is None:
+        raise ValueError("TOON format requested but 'toon' package is not installed")
 
     data_access = DatabaseAccess()
-    _ensure_target_column(data_access, table_name, target_column)
+    _ensure_target_column(data_access, table_name, target_column, use_toon)
 
     where_clause = None
     if not recompute_existing:
@@ -56,7 +64,7 @@ def preprocess_entries(
         f"table={table_name} source={source_column} target={target_column} "
         f"fetch_batch={fetch_batch_size} update_batch={update_batch_size} "
         f"progress_rows={progress_every_rows} progress_seconds={progress_every_seconds} "
-        f"recompute_existing={recompute_existing}",
+        f"recompute_existing={recompute_existing} use_toon={use_toon}",
         flush=True,
     )
 
@@ -93,13 +101,17 @@ def preprocess_entries(
                     continue
 
                 processed_payload = _preprocess_payload(payload)
-                payload_json = json.dumps(
-                    processed_payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
 
-                pending_updates.append((int(row_id), payload_json))
+                if use_toon:
+                    payload_str = convert_to_toon(processed_payload)
+                else:
+                    payload_str = json.dumps(
+                        processed_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+
+                pending_updates.append((int(row_id), payload_str))
 
                 if len(pending_updates) >= update_batch_size:
                     batch_count = _flush_updates(
@@ -107,6 +119,7 @@ def preprocess_entries(
                         table_name,
                         target_column,
                         pending_updates,
+                        use_toon,
                     )
                     update_conn.commit()
                     updated += batch_count
@@ -133,6 +146,7 @@ def preprocess_entries(
                     table_name,
                     target_column,
                     pending_updates,
+                    use_toon,
                 )
                 update_conn.commit()
                 updated += batch_count
@@ -145,18 +159,21 @@ def _ensure_target_column(
     data_access: DatabaseAccess,
     table_name: str,
     target_column: str,
+    use_toon: bool = False,
 ) -> None:
+    column_type = "TEXT" if use_toon else "JSONB"
     with data_access.get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 sql.SQL(
                     """
                     ALTER TABLE {table}
-                    ADD COLUMN IF NOT EXISTS {column} JSONB
+                    ADD COLUMN IF NOT EXISTS {column} {type}
                     """
                 ).format(
                     table=sql.Identifier(table_name),
                     column=sql.Identifier(target_column),
+                    type=sql.SQL(column_type),
                 )
             )
         conn.commit()
@@ -167,6 +184,7 @@ def _flush_updates(
     table_name: str,
     target_column: str,
     payloads: Sequence[tuple[int, str]],
+    use_toon: bool = False,
 ) -> int:
     if not payloads:
         return 0
@@ -175,16 +193,20 @@ def _flush_updates(
         sql.SQL("(%s::bigint, %s::text)") for _ in payloads
     )
 
+    # When using TOON, store as TEXT; otherwise cast to JSONB
+    cast_type = "text" if use_toon else "jsonb"
+
     update_sql = sql.SQL(
         """
         UPDATE {table} AS t
-        SET {column} = v.payload::jsonb
+        SET {column} = v.payload::{cast_type}
         FROM (VALUES {values}) AS v(id, payload)
         WHERE t.id = v.id
         """
     ).format(
         table=sql.Identifier(table_name),
         column=sql.Identifier(target_column),
+        cast_type=sql.SQL(cast_type),
         values=values_sql,
     )
 
@@ -218,6 +240,24 @@ def _preprocess_payload(payload: dict[str, Any]) -> dict[str, Any]:
         result["related"] = related
 
     return result
+
+
+def convert_to_toon(payload: dict[str, Any]) -> str:
+    """Convert a preprocessed dictionary payload to TOON format.
+
+    Args:
+        payload: The preprocessed dictionary entry (output of _preprocess_payload).
+
+    Returns:
+        A string representation in TOON format.
+
+    Raises:
+        ValueError: If the toon package is not available.
+    """
+    if toon_encode is None:
+        raise ValueError("TOON format requested but 'toon' package is not installed")
+
+    return toon_encode(payload)
 
 
 def _extract_senses(value: Any) -> list[dict[str, list[str]]] | None:
@@ -388,5 +428,6 @@ __all__ = [
     "PROGRESS_EVERY_ROWS",
     "PROGRESS_EVERY_SECONDS",
     "preprocess_entries",
+    "convert_to_toon",
 ]
 

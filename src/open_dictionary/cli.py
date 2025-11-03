@@ -293,6 +293,7 @@ def _cmd_pre_process(args: argparse.Namespace) -> int:
         progress_every_rows=args.progress_every_rows,
         progress_every_seconds=args.progress_every_seconds,
         recompute_existing=args.recompute_existing,
+        use_toon=args.toon,
     )
     return 0
 
@@ -572,6 +573,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--recompute-existing",
         action="store_true",
         help="Regenerate payloads even if the target column is already populated.",
+    )
+    pre_process_parser.add_argument(
+        "--toon",
+        action="store_true",
+        help="Convert processed payloads to TOON format (reduces token usage for LLMs).",
     )
     _add_database_options(pre_process_parser)
     pre_process_parser.set_defaults(func=_cmd_pre_process, _parser=pre_process_parser)
