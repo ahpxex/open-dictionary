@@ -88,11 +88,14 @@ uv run open-dictionary db-commonness --table dictionary_filtered_en
 
 Normalize raw Wiktionary payloads into a slimmer JSONB column without invoking LLMs (writes to `process` by default):
 
+_Optionally convert to TOON format (reduces token usage by 30-60% for LLM workflows, stores as TEXT instead of JSONB):_
+
 ```bash
 uv run open-dictionary pre-process \
   --table dictionary_filtered_en \
   --source-column data \
   --target-column processed
+  --toon
 ```
 
 Remove low-quality rows (zero common score, numeric tokens, legacy tags) directly in PostgreSQL:
