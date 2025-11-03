@@ -233,6 +233,7 @@ def _run_llm_batch(
                     f"[llm-define] row_id={row.row_id} failed: {exc}",
                     flush=True,
                 )
+                _log_error(row.row_id, row.payload, exc)
                 record_result(False)
             else:
                 payload_json = json.dumps(
@@ -371,6 +372,33 @@ def _report_completion(
         f"elapsed={elapsed:,.1f}s avg_rate={rate:,.0f} rows/s",
         flush=True,
     )
+
+
+def _log_error(
+    row_id: int,
+    payload: str,
+    error: Exception,
+    log_file: str = "data/llm_define_errors.log",
+) -> None:
+    """Write error details to a log file."""
+    import os
+    from datetime import datetime
+
+    try:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            timestamp = datetime.now().isoformat()
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Row ID: {row_id}\n")
+            f.write(f"Error: {type(error).__name__}: {error}\n")
+            f.write(f"\nPayload:\n{payload}\n")
+            f.write(f"{'='*80}\n")
+    except Exception as log_exc:  # pragma: no cover
+        print(
+            f"[llm-define] failed to write error log: {log_exc}",
+            flush=True,
+        )
 
 
 __all__ = [
