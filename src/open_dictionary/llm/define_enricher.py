@@ -393,6 +393,11 @@ def _log_error(
             f.write(f"Row ID: {row_id}\n")
             f.write(f"Error: {type(error).__name__}: {error}\n")
             f.write(f"\nPayload:\n{payload}\n")
+            
+            # Log the LLM response if it's attached to the exception
+            if hasattr(error, 'llm_response'):
+                f.write(f"\nLLM Response:\n{error.llm_response}\n") # type: ignore
+            
             f.write(f"{'='*80}\n")
     except Exception as log_exc:  # pragma: no cover
         print(

@@ -227,4 +227,9 @@ def define(input_data: str) -> Definition:
     """
     response = get_chat_response(instruction, input_data)
 
-    return Definition.model_validate_json(response)
+    try:
+        return Definition.model_validate_json(response)
+    except Exception as exc:
+        # Attach the raw response to the exception for error logging
+        exc.llm_response = response  # type: ignore
+        raise
