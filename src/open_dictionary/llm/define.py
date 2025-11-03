@@ -42,8 +42,29 @@ instruction = """
 
 **【示例 1】**
 
-**输入JSON:**
-`{"word": "run", "pos": "verb", "forms": [{"form": "runs", "tags": ["present", "singular", "third-person"]}, {"form": "running", "tags": ["participle", "present"]}, {"form": "ran", "tags": ["past"]}, {"form": "run", "tags": ["participle", "past"]}], "senses": [{"glosses": ["To move swiftly on foot, so that both feet leave the ground during each stride."]}, {"glosses": ["To manage, be in charge of (a business, campaign, etc.)."]}], "sounds": [{"ipa": "/rʌn/", "ogg_url": "url"}], "derived": [{"word": "runner"}, {"word": "runway"}], "etymology_text": "From Middle English ronnen, rennen, from Old English rinnan, iernan (“to run, flow”), and Old Norse rinna (“to run, flow”), both from Proto-Germanic *rinnaną (“to run, flow”)."}`
+**输入:**
+word: run
+pos: verb
+forms[4]:
+  - form: runs
+    tags[3]: present,singular,third-person
+  - form: running
+    tags[2]: participle,present
+  - form: ran
+    tags[1]: past
+  - form: run
+    tags[2]: participle,past
+senses[2]:
+  -
+    glosses[1]: "To move swiftly on foot, so that both feet leave the ground during each stride."
+  -
+    glosses[1]: "To manage, be in charge of (a business, campaign, etc.)."
+sounds[1,]{ipa,ogg_url}:
+  /rʌn/,url
+derived[2,]{word}:
+  runner
+  runway
+etymology_text: "From Middle English ronnen, rennen, from Old English rinnan, iernan (“to run, flow”), and Old Norse rinna (“to run, flow”), both from Proto-Germanic *rinnaną (“to run, flow”)."
 
 **你的JSON输出:**
 {
@@ -96,8 +117,23 @@ instruction = """
 
 **【示例 2】**
 
-**输入JSON:**
-`{"word": "philosophy", "pos": "noun", "forms": [{"form": "philosophies", "tags": ["plural"]}], "senses": [{"glosses": ["The study of the fundamental nature of knowledge, reality, and existence, especially when considered as an academic discipline."]}, {"glosses": ["A theory or attitude held by a person or organization that acts as a guiding principle for behavior."]}], "sounds": [{"ipa": "/fɪˈlɒsəfi/", "ogg_url": "url"}], "derived": [{"word": "philosopher"}, {"word": "philosophical"}], "etymology_text": "From Middle English philosophie, from Old French philosophie, from Latin philosophia, from Ancient Greek φιλοσοφία (philosophía, “love of wisdom”), from φίλος (phílos, “loving”) + σοφία (sophía, “wisdom”)."}`
+**输入:**
+word: philosophy
+pos: noun
+forms[1]:
+  - form: philosophies
+    tags[1]: plural
+senses[2]:
+  -
+    glosses[1]: "The study of the fundamental nature of knowledge, reality, and existence, especially when considered as an academic discipline."
+  -
+    glosses[1]: A theory or attitude held by a person or organization that acts as a guiding principle for behavior.
+sounds[1,]{ipa,ogg_url}:
+  /fɪˈlɒsəfi/,url
+derived[2,]{word}:
+  philosopher
+  philosophical
+etymology_text: "From Middle English philosophie, from Old French philosophie, from Latin philosophia, from Ancient Greek φιλοσοφία (philosophía, “love of wisdom”), from φίλος (phílos, “loving”) + σοφία (sophía, “wisdom”)."
 
 **你的JSON输出:**
 {
@@ -180,16 +216,15 @@ class Definition(BaseModel):
     etymology: str
 
 
-def define(input_json: dict) -> Definition:
-    """Generate a structured dictionary definition from Wiktionary JSON data.
+def define(input_data: str) -> Definition:
+    """Generate a structured dictionary definition from Wiktionary JSON/Toon data.
 
     Args:
-        input_json: Dictionary containing Wiktionary data
+        input_data: String containing Wiktionary data in JSON or Toon format
 
     Returns:
         Definition object with structured dictionary entry
     """
-    input_data = json.dumps(input_json, ensure_ascii=False)
     response = get_chat_response(instruction, input_data)
 
     return Definition.model_validate_json(response)
