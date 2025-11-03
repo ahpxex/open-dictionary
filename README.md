@@ -109,7 +109,7 @@ Generate structured Chinese learner-friendly entries with the LLM `define` workf
 ```bash
 uv run open-dictionary llm-define \
   --table dictionary_filtered_en \
-  --source-column data \
+  --source-column processed \
   --target-column new_speak
 ```
 
