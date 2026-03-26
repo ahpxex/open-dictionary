@@ -1,0 +1,762 @@
+{
+  "input_path": "/Users/ahpx/Downloads/raw-wiktextract-data.jsonl.gz",
+  "output_path": "fixtures/wiktionary/raw.jsonl",
+  "rows_scanned": 10329308,
+  "rows_selected": 1000,
+  "selected_bucket_counts": [
+    [
+      "en::noun",
+      66
+    ],
+    [
+      "en::adj",
+      34
+    ],
+    [
+      "en::name",
+      24
+    ],
+    [
+      "en::verb",
+      15
+    ],
+    [
+      "zh::noun",
+      6
+    ],
+    [
+      "sv::noun",
+      5
+    ],
+    [
+      "sv::verb",
+      4
+    ],
+    [
+      "en::phrase",
+      4
+    ],
+    [
+      "sh::noun",
+      3
+    ],
+    [
+      "ro::noun",
+      3
+    ],
+    [
+      "fi::noun",
+      3
+    ],
+    [
+      "de::adj",
+      3
+    ],
+    [
+      "ru::verb",
+      3
+    ],
+    [
+      "hu::noun",
+      3
+    ],
+    [
+      "haw::noun",
+      3
+    ],
+    [
+      "zh::character",
+      3
+    ],
+    [
+      "io::noun",
+      3
+    ],
+    [
+      "de::noun",
+      3
+    ],
+    [
+      "zh::verb",
+      3
+    ],
+    [
+      "en::prep",
+      3
+    ],
+    [
+      "it::verb",
+      2
+    ],
+    [
+      "la::verb",
+      2
+    ],
+    [
+      "pt::name",
+      2
+    ],
+    [
+      "mul::symbol",
+      2
+    ],
+    [
+      "el::noun",
+      2
+    ]
+  ],
+  "selected_examples": [
+    {
+      "feature_signature": "senses+examples+forms+sounds+etymology+categories",
+      "lang_code": "gl",
+      "line_number": 279933,
+      "pos": "noun",
+      "word": "poste"
+    },
+    {
+      "feature_signature": "senses+sounds+etymology+categories",
+      "lang_code": "es",
+      "line_number": 638928,
+      "pos": "verb",
+      "word": "enganche"
+    },
+    {
+      "feature_signature": "senses+forms+derived+sounds+etymology+categories",
+      "lang_code": "vi",
+      "line_number": 772962,
+      "pos": "noun",
+      "word": "má"
+    },
+    {
+      "feature_signature": "senses+forms+derived+sounds+etymology",
+      "lang_code": "fo",
+      "line_number": 1086169,
+      "pos": "noun",
+      "word": "fika"
+    },
+    {
+      "feature_signature": "senses+sounds",
+      "lang_code": "pt",
+      "line_number": 1170540,
+      "pos": "name",
+      "word": "Valter"
+    },
+    {
+      "feature_signature": "senses+forms+sounds",
+      "lang_code": "sh",
+      "line_number": 2471553,
+      "pos": "noun",
+      "word": "odbojkašica"
+    },
+    {
+      "feature_signature": "senses+forms+sounds+etymology",
+      "lang_code": "sh",
+      "line_number": 2481014,
+      "pos": "noun",
+      "word": "derište"
+    },
+    {
+      "feature_signature": "senses+categories",
+      "lang_code": "mul",
+      "line_number": 2592025,
+      "pos": "symbol",
+      "word": "th"
+    },
+    {
+      "feature_signature": "senses+forms",
+      "lang_code": "la",
+      "line_number": 2809888,
+      "pos": "verb",
+      "word": "exterseratis"
+    },
+    {
+      "feature_signature": "senses+forms+etymology+categories",
+      "lang_code": "la",
+      "line_number": 3380731,
+      "pos": "adj",
+      "word": "continuatus"
+    },
+    {
+      "feature_signature": "senses",
+      "lang_code": "it",
+      "line_number": 4601337,
+      "pos": "verb",
+      "word": "ordinarli"
+    },
+    {
+      "feature_signature": "senses+sounds+etymology",
+      "lang_code": "hu",
+      "line_number": 4805007,
+      "pos": "noun",
+      "word": "nevében"
+    },
+    {
+      "feature_signature": "senses+forms+sounds+categories",
+      "lang_code": "ru",
+      "line_number": 5586975,
+      "pos": "verb",
+      "word": "выносят"
+    },
+    {
+      "feature_signature": "senses+sounds+categories",
+      "lang_code": "de",
+      "line_number": 5817633,
+      "pos": "adj",
+      "word": "besonnensten"
+    },
+    {
+      "feature_signature": "senses+forms+categories",
+      "lang_code": "el",
+      "line_number": 6224665,
+      "pos": "noun",
+      "word": "ξενοδόχες"
+    },
+    {
+      "feature_signature": "senses+etymology",
+      "lang_code": "en",
+      "line_number": 6908813,
+      "pos": "adj",
+      "word": "cervicolumbar"
+    },
+    {
+      "feature_signature": "senses+forms+sounds+etymology+categories",
+      "lang_code": "fi",
+      "line_number": 8020607,
+      "pos": "noun",
+      "word": "turmeleminen"
+    },
+    {
+      "feature_signature": "senses+forms+related+sounds+etymology+categories",
+      "lang_code": "pl",
+      "line_number": 8329947,
+      "pos": "verb",
+      "word": "zaktualizować"
+    },
+    {
+      "feature_signature": "senses+forms+related+sounds+etymology",
+      "lang_code": "mt",
+      "line_number": 8652516,
+      "pos": "noun",
+      "word": "djamant"
+    },
+    {
+      "feature_signature": "senses+forms+etymology",
+      "lang_code": "ro",
+      "line_number": 8853928,
+      "pos": "noun",
+      "word": "termalitate"
+    }
+  ],
+  "selected_feature_signatures": [
+    [
+      "senses",
+      105
+    ],
+    [
+      "senses+forms",
+      75
+    ],
+    [
+      "senses+forms+sounds+etymology",
+      58
+    ],
+    [
+      "senses+forms+etymology",
+      55
+    ],
+    [
+      "senses+forms+sounds",
+      53
+    ],
+    [
+      "senses+sounds",
+      41
+    ],
+    [
+      "senses+forms+sounds+etymology+categories",
+      41
+    ],
+    [
+      "senses+forms+etymology+categories",
+      31
+    ],
+    [
+      "senses+forms+sounds+categories",
+      26
+    ],
+    [
+      "senses+sounds+etymology",
+      23
+    ],
+    [
+      "senses+etymology",
+      21
+    ],
+    [
+      "senses+forms+categories",
+      20
+    ],
+    [
+      "senses+forms+derived+sounds+etymology+categories",
+      20
+    ],
+    [
+      "senses+categories",
+      18
+    ],
+    [
+      "senses+examples+forms+sounds+etymology",
+      18
+    ],
+    [
+      "senses+forms+related+sounds+etymology",
+      16
+    ],
+    [
+      "senses+sounds+etymology+categories",
+      15
+    ],
+    [
+      "senses+forms+derived+sounds+etymology",
+      13
+    ],
+    [
+      "senses+etymology+categories",
+      10
+    ],
+    [
+      "senses+sounds+categories",
+      9
+    ],
+    [
+      "senses+forms+related+etymology",
+      7
+    ],
+    [
+      "senses+forms+related",
+      7
+    ],
+    [
+      "senses+examples+forms+sounds+etymology+categories",
+      6
+    ],
+    [
+      "senses+examples+forms+etymology",
+      6
+    ],
+    [
+      "senses+examples+forms+derived+sounds+etymology+categories",
+      6
+    ]
+  ],
+  "selected_lang_counts": [
+    [
+      "en",
+      159
+    ],
+    [
+      "zh",
+      22
+    ],
+    [
+      "ja",
+      15
+    ],
+    [
+      "fi",
+      14
+    ],
+    [
+      "sv",
+      14
+    ],
+    [
+      "it",
+      11
+    ],
+    [
+      "de",
+      11
+    ],
+    [
+      "hu",
+      11
+    ],
+    [
+      "pl",
+      11
+    ],
+    [
+      "fr",
+      11
+    ],
+    [
+      "la",
+      10
+    ],
+    [
+      "ru",
+      10
+    ],
+    [
+      "es",
+      10
+    ],
+    [
+      "pt",
+      9
+    ],
+    [
+      "vi",
+      8
+    ],
+    [
+      "is",
+      8
+    ],
+    [
+      "nl",
+      8
+    ],
+    [
+      "sh",
+      7
+    ],
+    [
+      "ro",
+      7
+    ],
+    [
+      "ko",
+      7
+    ],
+    [
+      "enm",
+      7
+    ],
+    [
+      "mul",
+      6
+    ],
+    [
+      "el",
+      6
+    ],
+    [
+      "gl",
+      6
+    ],
+    [
+      "da",
+      6
+    ]
+  ],
+  "selected_pos_counts": [
+    [
+      "noun",
+      401
+    ],
+    [
+      "verb",
+      179
+    ],
+    [
+      "adj",
+      150
+    ],
+    [
+      "name",
+      124
+    ],
+    [
+      "adv",
+      42
+    ],
+    [
+      "suffix",
+      16
+    ],
+    [
+      "pron",
+      12
+    ],
+    [
+      "character",
+      12
+    ],
+    [
+      "phrase",
+      12
+    ],
+    [
+      "intj",
+      11
+    ],
+    [
+      "romanization",
+      7
+    ],
+    [
+      "num",
+      5
+    ],
+    [
+      "prefix",
+      3
+    ],
+    [
+      "prep",
+      3
+    ],
+    [
+      "prep_phrase",
+      3
+    ],
+    [
+      "soft-redirect",
+      3
+    ],
+    [
+      "proverb",
+      3
+    ],
+    [
+      "symbol",
+      2
+    ],
+    [
+      "hard-redirect",
+      2
+    ],
+    [
+      "det",
+      2
+    ],
+    [
+      "root",
+      2
+    ],
+    [
+      "conj",
+      1
+    ],
+    [
+      "stem",
+      1
+    ],
+    [
+      "contraction",
+      1
+    ],
+    [
+      "syllable",
+      1
+    ]
+  ],
+  "top_source_buckets": [
+    [
+      "en::noun",
+      797790
+    ],
+    [
+      "la::verb",
+      676559
+    ],
+    [
+      "es::verb",
+      578436
+    ],
+    [
+      "it::verb",
+      399929
+    ],
+    [
+      "pt::verb",
+      284655
+    ],
+    [
+      "fr::verb",
+      245597
+    ],
+    [
+      "sv::noun",
+      216220
+    ],
+    [
+      "en::verb",
+      215052
+    ],
+    [
+      "ru::noun",
+      212597
+    ],
+    [
+      "ru::verb",
+      197864
+    ],
+    [
+      "en::name",
+      181438
+    ],
+    [
+      "gl::verb",
+      180708
+    ],
+    [
+      "en::adj",
+      180263
+    ],
+    [
+      "fi::noun",
+      173415
+    ],
+    [
+      "ca::verb",
+      144002
+    ],
+    [
+      "de::noun",
+      131406
+    ],
+    [
+      "es::noun",
+      126204
+    ],
+    [
+      "de::adj",
+      125932
+    ],
+    [
+      "it::noun",
+      119278
+    ],
+    [
+      "zh::soft-redirect",
+      118438
+    ],
+    [
+      "la::adj",
+      99420
+    ],
+    [
+      "fr::noun",
+      88426
+    ],
+    [
+      "zh::noun",
+      88016
+    ],
+    [
+      "de::verb",
+      86492
+    ],
+    [
+      "la::noun",
+      79911
+    ]
+  ],
+  "top_source_signatures": [
+    [
+      "senses",
+      3344871
+    ],
+    [
+      "senses+forms",
+      1185912
+    ],
+    [
+      "senses+forms+sounds",
+      835837
+    ],
+    [
+      "senses+forms+sounds+etymology",
+      529499
+    ],
+    [
+      "senses+sounds",
+      517850
+    ],
+    [
+      "senses+categories",
+      490608
+    ],
+    [
+      "senses+forms+etymology",
+      377893
+    ],
+    [
+      "senses+forms+sounds+etymology+categories",
+      279919
+    ],
+    [
+      "senses+sounds+categories",
+      267630
+    ],
+    [
+      "senses+forms+categories",
+      264991
+    ],
+    [
+      "senses+forms+sounds+categories",
+      218976
+    ],
+    [
+      "senses+etymology",
+      177588
+    ],
+    [
+      "senses+forms+etymology+categories",
+      107243
+    ],
+    [
+      "senses+sounds+etymology",
+      104190
+    ],
+    [
+      "senses+forms+related+sounds+etymology",
+      96427
+    ],
+    [
+      "senses+forms+derived+sounds+etymology",
+      89565
+    ],
+    [
+      "senses+forms+derived+sounds+etymology+categories",
+      87430
+    ],
+    [
+      "senses+sounds+etymology+categories",
+      65184
+    ],
+    [
+      "senses+examples+forms+sounds+etymology+categories",
+      58003
+    ],
+    [
+      "senses+forms+related+sounds+etymology+categories",
+      57841
+    ],
+    [
+      "senses+examples+forms+sounds+etymology",
+      54770
+    ],
+    [
+      "senses+examples+forms+etymology",
+      51442
+    ],
+    [
+      "plain",
+      47146
+    ],
+    [
+      "senses+forms+related+etymology",
+      43843
+    ],
+    [
+      "senses+etymology+categories",
+      41272
+    ]
+  ],
+  "total_buckets_seen": 17993,
+  "total_signatures_seen": 257
+}
