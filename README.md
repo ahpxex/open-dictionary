@@ -6,6 +6,8 @@
 
 New features are:
 
+- Explicit rewrite foundation with tracked pipeline runs
+- PostgreSQL-first raw ingestion for Wiktionary / Wiktextract snapshots
 - Streamlined raw ingestion and curation rewrite
 - Wiktionary grounding
   - Enormous words data across multiple languages
@@ -19,6 +21,32 @@ New features are:
 - Install project dependencies: `uv sync`
 - Configure a `.env` file with `DATABASE_URL`
 - Ensure a PostgreSQL database is reachable via that URL
+
+## Initialize The Rewrite Foundation
+
+Apply the rewrite schemas and metadata tables:
+
+```bash
+uv run open-dictionary db-init
+```
+
+This creates the initial `meta`, `raw`, `curated`, `llm`, and `export` schemas.
+
+## Run The First Rewrite Stage
+
+Ingest a Wiktionary snapshot into the tracked raw tables:
+
+```bash
+uv run open-dictionary raw-ingest --workdir data/raw
+```
+
+This command:
+
+- downloads the snapshot
+- extracts the JSONL archive
+- records a tracked pipeline run in `meta.pipeline_runs`
+- records the source snapshot in `meta.source_snapshots`
+- loads entries into `raw.wiktionary_entries`
 
 ## Run The Wiktionary Workflow
 

@@ -10,8 +10,16 @@ from pathlib import Path
 import psycopg
 from dotenv import load_dotenv
 
+from .config import load_settings
+from .db.bootstrap import FOUNDATION_VERSION, apply_foundation
+from .db.connection import get_connection
 from .db import cleaner as db_cleaner
 from .db import mark_commonness as db_commonness
+from .wikitionary.raw_ingestion import (
+    DEFAULT_RAW_TABLE,
+    RAW_INGEST_STAGE,
+    run_raw_ingestion,
+)
 from .wikitionary.downloader import DEFAULT_WIKTIONARY_URL, download_wiktionary_dump
 from .wikitionary.extract import extract_wiktionary_dump
 from .wikitionary.filter import filter_languages
@@ -27,6 +35,7 @@ DEFAULT_DICTIONARY_TABLE = "dictionary_en"
 
 
 COMMAND_NAMES = {
+    "db-init",
     "download",
     "extract",
     "filter",
@@ -35,6 +44,7 @@ COMMAND_NAMES = {
     "db-clean",
     "db-commonness",
     "pre-process",
+    "raw-ingest",
 }
 
 
@@ -69,6 +79,16 @@ def _get_conninfo(args: argparse.Namespace) -> str:
     return conninfo
 
 
+def _get_settings(args: argparse.Namespace):
+    try:
+        return load_settings(
+            env_file=getattr(args, "env_file", ".env"),
+            database_url_var=getattr(args, "database_url_var", "DATABASE_URL"),
+        )
+    except RuntimeError as exc:
+        args._parser.error(str(exc))
+
+
 def _cmd_download(args: argparse.Namespace) -> int:
     try:
         destination = download_wiktionary_dump(
@@ -82,6 +102,19 @@ def _cmd_download(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     print(f"Downloaded file to {destination}")  # type: ignore[func-returns-value]
+    return 0
+
+
+def _cmd_db_init(args: argparse.Namespace) -> int:
+    settings = _get_settings(args)
+
+    with get_connection(settings) as conn:
+        applied = apply_foundation(conn)
+
+    if applied:
+        print(f"Applied database foundation {FOUNDATION_VERSION}")
+    else:
+        print(f"Database foundation {FOUNDATION_VERSION} is already applied")
     return 0
 
 
@@ -236,11 +269,50 @@ def _cmd_pre_process(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_raw_ingest(args: argparse.Namespace) -> int:
+    settings = _get_settings(args)
+
+    try:
+        result = run_raw_ingestion(
+            settings=settings,
+            workdir=args.workdir,
+            url=args.url,
+            target_table=args.target_table,
+            overwrite_download=args.overwrite_download,
+            overwrite_extract=args.overwrite_extract,
+            skip_download=args.skip_download,
+            skip_extract=args.skip_extract,
+        )
+    except (FileNotFoundError, JsonlProcessingError) as exc:
+        args._parser.error(str(exc))
+    except RuntimeError as exc:  # pragma: no cover - network failure guard
+        args._parser.error(str(exc))
+    except (psycopg.Error, ValueError) as exc:
+        args._parser.error(f"Database error: {exc}")
+
+    print(
+        "Raw ingestion completed "
+        f"stage={RAW_INGEST_STAGE} "
+        f"run_id={result.run_id} "
+        f"snapshot_id={result.snapshot_id} "
+        f"rows_loaded={result.rows_loaded} "
+        f"archive_sha256={result.archive_sha256}"
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Utilities for downloading, extracting, and loading Wiktionary dumps.",
     )
     subparsers = parser.add_subparsers(dest="command")
+
+    db_init_parser = subparsers.add_parser(
+        "db-init",
+        help="Apply the rewrite foundation schemas and tables.",
+    )
+    _add_database_options(db_init_parser)
+    db_init_parser.set_defaults(func=_cmd_db_init, _parser=db_init_parser)
 
     download_parser = subparsers.add_parser(
         "download",
@@ -442,6 +514,49 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_database_options(pre_process_parser)
     pre_process_parser.set_defaults(func=_cmd_pre_process, _parser=pre_process_parser)
+
+    raw_ingest_parser = subparsers.add_parser(
+        "raw-ingest",
+        help="Run the tracked raw Wiktionary ingestion stage into the rewrite tables.",
+    )
+    raw_ingest_parser.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Working directory for archive and extracted JSONL files (default: %(default)s).",
+    )
+    raw_ingest_parser.add_argument(
+        "--url",
+        default=DEFAULT_WIKTIONARY_URL,
+        help="Source URL for the Wiktionary dump (default: official raw dataset).",
+    )
+    raw_ingest_parser.add_argument(
+        "--target-table",
+        default=DEFAULT_RAW_TABLE,
+        help="Destination raw table for imported entries (default: %(default)s).",
+    )
+    raw_ingest_parser.add_argument(
+        "--overwrite-download",
+        action="store_true",
+        help="Force re-download even if the archive already exists.",
+    )
+    raw_ingest_parser.add_argument(
+        "--overwrite-extract",
+        action="store_true",
+        help="Force re-extraction even if the JSONL file already exists.",
+    )
+    raw_ingest_parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Reuse an existing archive in workdir instead of downloading it.",
+    )
+    raw_ingest_parser.add_argument(
+        "--skip-extract",
+        action="store_true",
+        help="Reuse an existing extracted JSONL file in workdir instead of extracting it.",
+    )
+    _add_database_options(raw_ingest_parser)
+    raw_ingest_parser.set_defaults(func=_cmd_raw_ingest, _parser=raw_ingest_parser)
 
     db_clean_parser = subparsers.add_parser(
         "db-clean",
