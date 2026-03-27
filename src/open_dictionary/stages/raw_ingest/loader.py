@@ -33,7 +33,12 @@ def load_snapshot(
     stage_name: str,
     chunk_size: int = 5000,
 ) -> LoadStats:
-    if _snapshot_has_rows(conn, snapshot_id=snapshot_id, target_table=target_table):
+    if _snapshot_is_preexisting(
+        conn,
+        snapshot_id=snapshot_id,
+        target_table=target_table,
+        stage_name=stage_name,
+    ):
         stats = _existing_snapshot_stats(conn, snapshot_id=snapshot_id, target_table=target_table)
         save_checkpoint(
             conn,
@@ -186,6 +191,38 @@ def flush_rows(
                 )
 
     return len(rows)
+
+
+def _snapshot_is_preexisting(
+    conn,
+    *,
+    snapshot_id: UUID,
+    target_table: str,
+    stage_name: str,
+) -> bool:
+    if _snapshot_has_rows(conn, snapshot_id=snapshot_id, target_table=target_table):
+        return True
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT 1 FROM raw.wiktionary_ingest_anomalies WHERE snapshot_id = %s LIMIT 1",
+            (snapshot_id,),
+        )
+        if cursor.fetchone() is not None:
+            return True
+
+        cursor.execute(
+            """
+            SELECT 1
+            FROM meta.pipeline_runs
+            WHERE stage = %s
+              AND status = 'succeeded'
+              AND COALESCE(stats->>'snapshot_id', config->>'snapshot_id') = %s
+            LIMIT 1
+            """,
+            (stage_name, str(snapshot_id)),
+        )
+        return cursor.fetchone() is not None
 
 
 def _snapshot_has_rows(conn, *, snapshot_id: UUID, target_table: str) -> bool:
