@@ -82,14 +82,12 @@ These are core lexical categories and should be included in the curated layer:
 These may be useful, but should be explicitly marked as special:
 
 - `proverb`
-- `name`
 - `suffix`
 - `prefix`
 
 Suggested flags:
 
 - `entry_type: proverb`
-- `entry_type: proper_name`
 - `entry_type: affix`
 
 These records should not be silently mixed into ordinary lexical entries.
@@ -98,14 +96,30 @@ These records should not be silently mixed into ordinary lexical entries.
 
 These should generally not become top-level dictionary entries:
 
+- relation-dominant `form_of` entries
+- relation-dominant `alternative_of` entries
 - `romanization`
 - `soft-redirect`
 - `hard-redirect`
 
 Suggested handling:
 
-- represent them as aliases, redirect edges, or alternate-surface mappings
+- represent them as aliases, redirect edges, alternate-surface mappings, or
+  subordinate form relations
 - attach them to a canonical headword when possible
+
+### Triage with flag in V1
+
+These should not be part of the default main export, but they are not
+automatically discarded:
+
+- `name`
+
+Suggested handling:
+
+- preserve them through triage or separate buckets
+- attach `entry_type: proper_name`
+- only promote them into main export through later rule tightening
 
 ### Drop by default in V1
 
@@ -440,8 +454,9 @@ Default:
 
 Default:
 
-- keep with `entry_type: proper_name`
+- triage by default with `entry_type: proper_name`
 - do not silently mix with ordinary lexical nouns
+- only promote selected subclasses later if product scope explicitly expands
 
 ### 9. `character`
 
@@ -484,6 +499,21 @@ Default:
 
 - normalize when deterministic
 - triage when not deterministic
+
+### 14. Relation-dominant grammatical forms
+
+Examples:
+
+- plural-of entries
+- case-form entries
+- participle-of entries
+- alternative-form entries
+
+Default:
+
+- do not export as main dictionary entries in V1
+- convert into relations or subordinate forms where possible
+- triage when relation conversion is not deterministic
 
 ## Triage Policy
 
@@ -765,6 +795,7 @@ least:
 - `oversized_forms`
 - `oversized_sounds`
 - `record_type_out_of_scope`
+- `derived_form_entry`
 - `parser_anomaly`
 
 ### Required triage actions in V1

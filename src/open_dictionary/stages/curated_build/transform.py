@@ -11,9 +11,11 @@ from uuid import NAMESPACE_URL, uuid5
 KEEP_POS = {"noun", "verb", "adj", "adv", "pron", "num", "prep", "phrase", "intj", "det"}
 KEEP_WITH_FLAG_POS = {
     "proverb": "entry_type:proverb",
-    "name": "entry_type:proper_name",
     "suffix": "entry_type:affix",
     "prefix": "entry_type:affix",
+}
+TRIAGE_WITH_FLAG_POS = {
+    "name": ("entry_type:proper_name", "defer"),
 }
 RELATION_POS = {
     "romanization": "convert_to_relation",
@@ -132,11 +134,41 @@ def classify_raw_row(raw_row: dict[str, Any]) -> tuple[str, TriageItem | None]:
             ),
         )
 
+    dominant_relation = detect_relation_dominant_entry(payload)
+    if dominant_relation is not None:
+        return (
+            "triage",
+            TriageItem(
+                lang_code=lang_code,
+                word=word,
+                reason_code="derived_form_entry",
+                severity="medium",
+                suggested_action="convert_to_relation",
+                raw_record_refs=ref,
+                payload={"pos": pos, "dominant_relation": dominant_relation},
+            ),
+        )
+
     if pos in KEEP_POS:
         return "keep", None
 
     if pos in KEEP_WITH_FLAG_POS:
         return "keep_with_flag", None
+
+    if pos in TRIAGE_WITH_FLAG_POS:
+        flag, action = TRIAGE_WITH_FLAG_POS[pos]
+        return (
+            "triage",
+            TriageItem(
+                lang_code=lang_code,
+                word=word,
+                reason_code="record_type_out_of_scope",
+                severity="medium",
+                suggested_action=action,
+                raw_record_refs=ref,
+                payload={"pos": pos, "entry_flag": flag},
+            ),
+        )
 
     if pos in RELATION_POS:
         return (
@@ -188,6 +220,38 @@ def collect_entry_flags(raw_rows: list[dict[str, Any]]) -> set[str]:
         if flag:
             flags.add(flag)
     return flags
+
+
+def detect_relation_dominant_entry(payload: dict[str, Any]) -> str | None:
+    senses = payload.get("senses")
+    if not isinstance(senses, list) or not senses:
+        return None
+
+    dominant_types: set[str] = set()
+    lexical_sense_found = False
+
+    for sense in senses:
+        if not isinstance(sense, dict):
+            continue
+        relations = normalize_sense_relations(sense)
+        relation_types = {relation["relation_type"] for relation in relations}
+        gloss = first_non_empty_text(sense.get("glosses")) or first_non_empty_text(sense.get("raw_glosses"))
+
+        if relation_types & {"form_of", "alternative_of"}:
+            dominant_types |= relation_types & {"form_of", "alternative_of"}
+            if gloss and not looks_like_derived_form_gloss(gloss):
+                lexical_sense_found = True
+        else:
+            lexical_sense_found = True
+
+    if lexical_sense_found or not dominant_types:
+        return None
+
+    if "form_of" in dominant_types:
+        return "form_of"
+    if "alternative_of" in dominant_types:
+        return "alternative_of"
+    return None
 
 
 def build_source_summary(raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -547,6 +611,33 @@ def normalize_nullable_text(value: Any) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def looks_like_derived_form_gloss(gloss: str) -> bool:
+    normalized = gloss.casefold()
+    markers = (
+        "alternative form of",
+        "alternative spelling of",
+        "alternative case form of",
+        "plural of",
+        "singular of",
+        "feminine plural of",
+        "masculine plural of",
+        "feminine singular of",
+        "masculine singular of",
+        "dative plural of",
+        "genitive plural of",
+        "accusative plural of",
+        "nominative plural of",
+        "inflected infinitive of",
+        "infinitive of",
+        "participle of",
+        "past participle of",
+        "present participle of",
+        "comparative of",
+        "superlative of",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def normalize_string_list(value: Any) -> list[str]:

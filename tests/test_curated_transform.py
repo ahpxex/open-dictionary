@@ -52,12 +52,15 @@ def test_classify_raw_row_keeps_core_pos() -> None:
     assert triage is None
 
 
-def test_classify_raw_row_marks_name_as_keep_with_flag() -> None:
-    # This case ensures `name` records survive V1 while still being marked as special.
+def test_classify_raw_row_triages_name_entries_by_default() -> None:
+    # This case captures the tightened V1 scope: proper names no longer enter
+    # the main export set by default.
     decision, triage = curated.classify_raw_row(make_raw_row(pos="name"))
 
-    assert decision == "keep_with_flag"
-    assert triage is None
+    assert decision == "triage"
+    assert triage is not None
+    assert triage.reason_code == "record_type_out_of_scope"
+    assert triage.payload["entry_flag"] == "entry_type:proper_name"
 
 
 def test_classify_raw_row_triages_relation_only_pos() -> None:
@@ -87,6 +90,52 @@ def test_classify_raw_row_triages_unknown_pos() -> None:
     assert triage.reason_code == "unknown_pos"
 
 
+def test_classify_raw_row_triages_relation_dominant_form_entry() -> None:
+    # This case ensures plural-of / form-of style rows no longer survive as
+    # first-class dictionary entries in the tightened curation scope.
+    row = make_raw_row(
+        pos="adj",
+        payload_overrides={
+            "senses": [
+                {
+                    "glosses": ["feminine plural of eterocrono"],
+                    "form_of": [{"word": "eterocrono"}],
+                    "tags": ["feminine", "plural"],
+                }
+            ]
+        },
+    )
+
+    decision, triage = curated.classify_raw_row(row)
+
+    assert decision == "triage"
+    assert triage is not None
+    assert triage.reason_code == "derived_form_entry"
+    assert triage.suggested_action == "convert_to_relation"
+
+
+def test_classify_raw_row_triages_relation_dominant_alternative_entry() -> None:
+    # This case ensures alternative-form records are downgraded out of the main export set.
+    row = make_raw_row(
+        pos="adj",
+        payload_overrides={
+            "senses": [
+                {
+                    "glosses": ["alternative form of чэфы (čɛfə)"],
+                    "alt_of": [{"word": "чэфы"}],
+                    "tags": ["alternative"],
+                }
+            ]
+        },
+    )
+
+    decision, triage = curated.classify_raw_row(row)
+
+    assert decision == "triage"
+    assert triage is not None
+    assert triage.reason_code == "derived_form_entry"
+
+
 def test_classify_raw_row_triages_missing_lexical_identity() -> None:
     # This case protects the curated layer from building entries with no stable word key.
     row = make_raw_row(word="", payload_overrides={"word": "   "})
@@ -98,12 +147,12 @@ def test_classify_raw_row_triages_missing_lexical_identity() -> None:
 
 
 def test_collect_entry_flags_accumulates_keep_with_flag_pos_values() -> None:
-    # This case ensures special POS values become entry-level flags after merge.
-    rows = [make_raw_row(pos="name"), make_raw_row(row_id=2, pos="suffix")]
+    # This case ensures only still-kept flagged POS values propagate into entry flags.
+    rows = [make_raw_row(pos="proverb"), make_raw_row(row_id=2, pos="suffix")]
 
     flags = curated.collect_entry_flags(rows)
 
-    assert flags == {"entry_type:proper_name", "entry_type:affix"}
+    assert flags == {"entry_type:proverb", "entry_type:affix"}
 
 
 def test_build_source_summary_collects_provenance_references() -> None:
@@ -321,6 +370,30 @@ def test_build_curated_entry_returns_only_triage_when_all_rows_are_out_of_scope(
     assert output.entry is None
     assert output.relations == []
     assert len(output.triage_items) == 1
+
+
+def test_build_curated_entry_returns_only_triage_for_relation_dominant_form_entries() -> None:
+    # This case verifies that grammatical-form-only entries stop at triage and
+    # do not leak into the main curated export.
+    rows = [
+        make_raw_row(
+            pos="adj",
+            payload_overrides={
+                "senses": [
+                    {
+                        "glosses": ["feminine plural of eterocrono"],
+                        "form_of": [{"word": "eterocrono"}],
+                    }
+                ]
+            },
+        )
+    ]
+
+    output = curated.build_curated_entry(rows)
+
+    assert output.entry is None
+    assert output.relations == []
+    assert any(item.reason_code == "derived_form_entry" for item in output.triage_items)
 
 
 def test_build_entry_hash_is_stable_for_equivalent_payloads() -> None:
