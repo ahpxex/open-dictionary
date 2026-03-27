@@ -518,25 +518,387 @@ Send a record to triage when:
 - the record is structurally valid but product relevance is unclear
 - normalization would otherwise require inventing a new editorial rule
 
-## V1 Curated Contract Direction
+## V1 Curated Schema
 
-The first curated contract should likely contain:
+The V1 curated schema is a formal contract, not a placeholder.
 
+The system may store this contract either:
+
+- as one primary JSONB payload per curated entry, plus helper metadata columns
+- or as a normalized relational model with a materialized JSONB view
+
+Either storage strategy is acceptable.
+The logical contract below is mandatory.
+
+### Top-level curated entry
+
+Each curated entry must contain the following top-level fields:
+
+- `entry_id`
 - `word`
 - `normalized_word`
 - `lang`
 - `lang_code`
 - `entry_flags`
+- `source_summary`
 - `etymology_groups`
 - `pos_groups`
 
-Each `pos_group` should likely contain:
+### Top-level field definitions
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `entry_id` | string | yes | Stable entry identifier for the curated layer |
+| `word` | string | yes | Canonical display headword |
+| `normalized_word` | string | yes | Normalized grouping key used for merge decisions |
+| `lang` | string | yes | Human-readable language name |
+| `lang_code` | string | yes | Machine-readable language code |
+| `entry_flags` | array of strings | yes | Entry-level flags such as `proper_name`, `affix`, `proverb`, `triaged` |
+| `source_summary` | object | yes | Minimal provenance summary for the curated entry |
+| `etymology_groups` | array of objects | yes | Distinct etymology clusters under the same headword |
+| `pos_groups` | array of objects | yes | Part-of-speech groupings under the same headword |
+
+### `source_summary`
+
+`source_summary` must contain:
+
+- `raw_record_count`
+- `raw_snapshot_ids`
+- `raw_run_ids`
+- `raw_record_ids` or an equivalent provenance pointer list
+
+Minimum contract:
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `raw_record_count` | integer | yes | Number of raw records merged into this entry |
+| `raw_snapshot_ids` | array of strings | yes | Snapshot ids contributing to this entry |
+| `raw_run_ids` | array of strings | yes | Raw ingest run ids contributing to this entry |
+| `raw_record_refs` | array of objects | yes | Stable references to contributing raw records |
+
+Each `raw_record_ref` should include:
+
+- `snapshot_id`
+- `raw_record_id`
+- `source_line`
+- `pos`
+
+### `etymology_groups`
+
+An etymology group represents a distinct origin path worth preserving.
+
+Each `etymology_group` must contain:
+
+- `etymology_id`
+- `etymology_text`
+- `etymology_flags`
+- `member_pos`
+- `source_refs`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `etymology_id` | string | yes | Stable identifier within the entry |
+| `etymology_text` | string or null | yes | Normalized etymology text |
+| `etymology_flags` | array of strings | yes | Flags such as `missing_etymology`, `merged_etymology`, `conflicted_etymology` |
+| `member_pos` | array of strings | yes | POS values attached to this etymology group |
+| `source_refs` | array of objects | yes | Raw source references feeding this etymology group |
+
+### `pos_groups`
+
+Each `pos_group` must contain:
 
 - `pos`
-- normalized sense list
-- normalized forms
-- compact pronunciations
-- compact relations
+- `pos_flags`
+- `etymology_id`
+- `senses`
+- `forms`
+- `pronunciations`
+- `relations`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `pos` | string | yes | Canonical POS label |
+| `pos_flags` | array of strings | yes | Group-level flags such as `proper_name`, `derived_from_form_only`, `triaged_pos` |
+| `etymology_id` | string or null | yes | Owning etymology group identifier |
+| `senses` | array of objects | yes | Normalized lexical senses |
+| `forms` | array of objects | yes | Normalized forms relevant to this POS |
+| `pronunciations` | array of objects | yes | Reduced pronunciation payload |
+| `relations` | array of objects | yes | Normalized semantic or structural relations |
+
+### `senses`
+
+Each normalized sense must contain:
+
+- `sense_id`
+- `gloss`
+- `raw_gloss`
+- `tags`
+- `qualifier`
+- `topics`
+- `examples`
+- `relations`
+- `sense_flags`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `sense_id` | string | yes | Stable identifier within the POS group |
+| `gloss` | string | yes | Preferred normalized gloss |
+| `raw_gloss` | string or null | yes | Optional original gloss when useful |
+| `tags` | array of strings | yes | Normalized sense tags |
+| `qualifier` | string or null | yes | Preserved qualifier text |
+| `topics` | array of strings | yes | Normalized topical labels |
+| `examples` | array of objects | yes | Curated examples |
+| `relations` | array of objects | yes | Sense-local relations such as `form_of` or `alternative_of` |
+| `sense_flags` | array of strings | yes | Flags such as `figurative`, `archaic`, `triaged_sense` |
+
+### `examples`
+
+Each example must contain:
+
+- `text`
+- `translation`
+- `type`
+- `ref`
+- `example_flags`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `text` | string | yes | Source example text |
+| `translation` | string or null | yes | Any provided translation |
+| `type` | string or null | yes | Example/quote label when present |
+| `ref` | string or null | yes | Citation text when present |
+| `example_flags` | array of strings | yes | Flags such as `quote`, `machine_translation`, `trimmed` |
+
+### `forms`
+
+Each normalized form must contain:
+
+- `form`
+- `tags`
+- `roman`
+- `form_flags`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `form` | string | yes | Surface form |
+| `tags` | array of strings | yes | Normalized form tags |
+| `roman` | string or null | yes | Optional romanization |
+| `form_flags` | array of strings | yes | Flags such as `alternative_spelling`, `trimmed_form_set` |
+
+### `pronunciations`
+
+Each normalized pronunciation must contain:
+
+- `ipa`
+- `pronunciation_text`
+- `audio_url`
+- `audio_format`
+- `tags`
+- `pronunciation_flags`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `ipa` | string or null | yes | IPA string if available |
+| `pronunciation_text` | string or null | yes | Alternate pronunciation text such as `zh_pron` |
+| `audio_url` | string or null | yes | Preferred audio URL |
+| `audio_format` | string or null | yes | Audio format such as `ogg` or `mp3` |
+| `tags` | array of strings | yes | Region or context tags |
+| `pronunciation_flags` | array of strings | yes | Flags such as `preferred_audio`, `trimmed_audio_set` |
+
+### `relations`
+
+Each normalized relation must contain:
+
+- `relation_type`
+- `target_word`
+- `target_lang_code`
+- `relation_flags`
+- `source_scope`
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `relation_type` | string | yes | One of the normalized relation types |
+| `target_word` | string | yes | Target surface form |
+| `target_lang_code` | string or null | yes | Target language code when known |
+| `relation_flags` | array of strings | yes | Flags such as `inferred`, `sense_local`, `source_noisy` |
+| `source_scope` | string | yes | `entry`, `pos_group`, or `sense` |
+
+### Required relation types in V1
+
+The implementation must support at least these normalized relation types:
+
+- `derived_term`
+- `related_term`
+- `synonym`
+- `antonym`
+- `form_of`
+- `alternative_of`
+- `redirect_to`
+- `romanization_of`
+
+`descendant` may exist in storage but does not need to be promoted into the
+main curated payload in V1.
+
+## V1 Triage Schema
+
+Triage is part of the curated contract.
+It is not an informal side channel.
+
+The system must be able to persist triaged records or triaged decisions with at
+least:
+
+- `triage_id`
+- `lang_code`
+- `word`
+- `reason_code`
+- `severity`
+- `raw_record_refs`
+- `suggested_action`
+- `status`
+
+### Required triage reason codes in V1
+
+- `unknown_pos`
+- `missing_lexical_identity`
+- `missing_gloss`
+- `conflicting_merge`
+- `oversized_forms`
+- `oversized_sounds`
+- `record_type_out_of_scope`
+- `parser_anomaly`
+
+### Required triage actions in V1
+
+- `drop`
+- `keep_with_flag`
+- `convert_to_relation`
+- `defer`
+- `requires_rule_update`
+
+## V1 Database Shape
+
+The minimum recommended PostgreSQL shape for the curated layer is:
+
+- `curated.entries`
+- `curated.entry_relations`
+- `curated.triage_queue`
+
+### `curated.entries`
+
+Recommended columns:
+
+- `entry_id UUID PRIMARY KEY`
+- `lang_code TEXT NOT NULL`
+- `normalized_word TEXT NOT NULL`
+- `word TEXT NOT NULL`
+- `payload JSONB NOT NULL`
+- `entry_flags TEXT[] NOT NULL DEFAULT '{}'`
+- `source_summary JSONB NOT NULL`
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+
+Recommended unique key:
+
+- `(lang_code, normalized_word)`
+
+### `curated.entry_relations`
+
+Recommended columns:
+
+- `relation_id BIGSERIAL PRIMARY KEY`
+- `entry_id UUID NOT NULL REFERENCES curated.entries(entry_id)`
+- `relation_type TEXT NOT NULL`
+- `target_word TEXT NOT NULL`
+- `target_lang_code TEXT`
+- `source_scope TEXT NOT NULL`
+- `payload JSONB NOT NULL DEFAULT '{}'::jsonb`
+
+This table is optional if all relations stay embedded inside `payload`, but
+keeping it normalized is recommended for later graph features.
+
+### `curated.triage_queue`
+
+Recommended columns:
+
+- `triage_id BIGSERIAL PRIMARY KEY`
+- `lang_code TEXT`
+- `word TEXT`
+- `reason_code TEXT NOT NULL`
+- `severity TEXT NOT NULL`
+- `suggested_action TEXT NOT NULL`
+- `status TEXT NOT NULL DEFAULT 'open'`
+- `raw_record_refs JSONB NOT NULL`
+- `payload JSONB NOT NULL DEFAULT '{}'::jsonb`
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+- `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+
+## Example Curated Entry Shape
+
+The following is illustrative, not exhaustive:
+
+```json
+{
+  "entry_id": "uuid",
+  "word": "encrypt",
+  "normalized_word": "encrypt",
+  "lang": "English",
+  "lang_code": "en",
+  "entry_flags": [],
+  "source_summary": {
+    "raw_record_count": 1,
+    "raw_snapshot_ids": ["uuid"],
+    "raw_run_ids": ["uuid"],
+    "raw_record_refs": [
+      {
+        "snapshot_id": "uuid",
+        "raw_record_id": 123,
+        "source_line": 456,
+        "pos": "verb"
+      }
+    ]
+  },
+  "etymology_groups": [
+    {
+      "etymology_id": "et1",
+      "etymology_text": "From en- + -crypt ...",
+      "etymology_flags": [],
+      "member_pos": ["verb"],
+      "source_refs": [{"raw_record_id": 123}]
+    }
+  ],
+  "pos_groups": [
+    {
+      "pos": "verb",
+      "pos_flags": [],
+      "etymology_id": "et1",
+      "senses": [
+        {
+          "sense_id": "s1",
+          "gloss": "To conceal information by means of a code or cipher.",
+          "raw_gloss": null,
+          "tags": [],
+          "qualifier": null,
+          "topics": [],
+          "examples": [],
+          "relations": [],
+          "sense_flags": []
+        }
+      ],
+      "forms": [],
+      "pronunciations": [],
+      "relations": [
+        {
+          "relation_type": "derived_term",
+          "target_word": "encryption",
+          "target_lang_code": "en",
+          "relation_flags": [],
+          "source_scope": "entry"
+        }
+      ]
+    }
+  ]
+}
+```
 
 This is still a word-centric model, not a Wiktionary mirror.
 
@@ -544,7 +906,6 @@ This is still a word-centric model, not a Wiktionary mirror.
 
 This document does not yet define:
 
-- final user-facing JSON schema names
 - the LLM prompt contract
 - export formats
 - scoring and prioritization logic

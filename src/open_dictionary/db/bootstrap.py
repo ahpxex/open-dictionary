@@ -145,6 +145,114 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             """,
         ),
     ),
+    Migration(
+        version="20260327_curated_v1",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS curated.entries (
+                entry_id UUID PRIMARY KEY,
+                lang_code TEXT NOT NULL,
+                normalized_word TEXT NOT NULL,
+                word TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                entry_flags TEXT[] NOT NULL DEFAULT '{}',
+                source_summary JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS curated_entries_lang_word_uidx
+            ON curated.entries (lang_code, normalized_word)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS curated.entry_relations (
+                relation_id BIGSERIAL PRIMARY KEY,
+                entry_id UUID NOT NULL REFERENCES curated.entries(entry_id) ON DELETE CASCADE,
+                relation_type TEXT NOT NULL,
+                target_word TEXT NOT NULL,
+                target_lang_code TEXT,
+                source_scope TEXT NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS curated_entry_relations_entry_id_idx
+            ON curated.entry_relations (entry_id)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS curated.triage_queue (
+                triage_id BIGSERIAL PRIMARY KEY,
+                lang_code TEXT,
+                word TEXT,
+                reason_code TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                suggested_action TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                raw_record_refs JSONB NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+        ),
+    ),
+    Migration(
+        version="20260327_llm_v1",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS llm.prompt_versions (
+                prompt_version TEXT PRIMARY KEY,
+                prompt_text TEXT NOT NULL,
+                output_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS llm.entry_enrichments (
+                enrichment_id BIGSERIAL PRIMARY KEY,
+                run_id UUID NOT NULL REFERENCES meta.pipeline_runs(run_id),
+                entry_id UUID NOT NULL REFERENCES curated.entries(entry_id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                prompt_version TEXT NOT NULL REFERENCES llm.prompt_versions(prompt_version),
+                input_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+                request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                response_payload JSONB,
+                raw_response TEXT,
+                error TEXT,
+                retries INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS llm_entry_enrichments_entry_id_idx
+            ON llm.entry_enrichments (entry_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS llm_entry_enrichments_status_idx
+            ON llm.entry_enrichments (status)
+            """,
+        ),
+    ),
+    Migration(
+        version="20260327_export_v1",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS export.artifacts (
+                artifact_id BIGSERIAL PRIMARY KEY,
+                run_id UUID NOT NULL REFERENCES meta.pipeline_runs(run_id),
+                artifact_type TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                output_sha256 TEXT NOT NULL,
+                entry_count INTEGER NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+        ),
+    ),
 )
 
 
