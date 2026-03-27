@@ -11,3 +11,7 @@ wheels/
 .env
 words.txt
 .DS_Store
+.coverage
+.tracecov_raw_ingest_review_prog/
+.serena/
+data/

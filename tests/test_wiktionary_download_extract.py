@@ -6,8 +6,8 @@ import urllib.error
 
 import pytest
 
-from open_dictionary.wikitionary.downloader import download_wiktionary_dump
-from open_dictionary.wikitionary.extract import extract_wiktionary_dump
+from open_dictionary.sources.wiktionary.download import download_wiktionary_dump
+from open_dictionary.sources.wiktionary.extract import extract_wiktionary_dump
 
 
 class FakeResponse:
@@ -36,8 +36,8 @@ def test_download_wiktionary_dump_streams_response_to_file(
     # a real network call in the test suite.
     payload = b"fixture-bytes"
     monkeypatch.setattr(
-        "open_dictionary.wikitionary.downloader.urllib.request.urlopen",
-        lambda url: FakeResponse(payload),
+        "open_dictionary.sources.wiktionary.download.urllib.request.urlopen",
+        lambda request, timeout=60: FakeResponse(payload),
     )
 
     destination = tmp_path / "download" / "raw.jsonl.gz"
@@ -55,8 +55,8 @@ def test_download_wiktionary_dump_raises_runtime_error_on_network_failure(
     # This case ensures callers get a domain-level RuntimeError instead of
     # leaking raw urllib exceptions from the download helper.
     monkeypatch.setattr(
-        "open_dictionary.wikitionary.downloader.urllib.request.urlopen",
-        lambda url: (_ for _ in ()).throw(urllib.error.URLError("offline")),
+        "open_dictionary.sources.wiktionary.download.urllib.request.urlopen",
+        lambda request, timeout=60: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
 
     with pytest.raises(RuntimeError, match="Failed to download Wiktionary dump"):

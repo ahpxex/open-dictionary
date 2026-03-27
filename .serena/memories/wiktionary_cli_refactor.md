@@ -1,1 +1,0 @@
-Refactored Open Dictionary CLI: new central src/open_dictionary/cli.py registers commands; streaming logic in wikitionary/transform.py uses shared StreamingProgress from wikitionary/progress.py; pipeline orchestration moved to wikitionary/pipeline.py; filter command supports 'all' languages with progress output; README documents filter usage.
