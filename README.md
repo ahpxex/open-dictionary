@@ -40,13 +40,25 @@ Ingest a Wiktionary snapshot into the tracked raw tables:
 uv run open-dictionary raw-ingest --workdir data/raw
 ```
 
+Or ingest from an already downloaded local archive:
+
+```bash
+uv run open-dictionary raw-ingest \
+  --archive-path /path/to/raw-wiktextract-data.jsonl.gz \
+  --workdir data/raw
+```
+
 This command:
 
-- downloads the snapshot
-- extracts the JSONL archive
+- downloads or registers a source snapshot
 - records a tracked pipeline run in `meta.pipeline_runs`
 - records the source snapshot in `meta.source_snapshots`
+- writes stage progress into `meta.stage_checkpoints`
 - loads entries into `raw.wiktionary_entries`
+- records malformed source records in `raw.wiktionary_ingest_anomalies`
+
+The rewrite raw-ingest stage reads `.jsonl.gz` archives directly and does not
+require a fully materialized extracted JSONL file.
 
 ## Run The Wiktionary Workflow
 

@@ -11,14 +11,15 @@ import psycopg
 from dotenv import load_dotenv
 
 from .config import load_settings
-from .db.bootstrap import FOUNDATION_VERSION, apply_foundation
+from .db.bootstrap import LATEST_FOUNDATION_VERSION, apply_foundation
 from .db.connection import get_connection
 from .db import cleaner as db_cleaner
 from .db import mark_commonness as db_commonness
-from .wikitionary.raw_ingestion import (
+from .sources.wiktionary.acquire import DEFAULT_WIKTIONARY_SOURCE_URL
+from .stages.raw_ingest import (
     DEFAULT_RAW_TABLE,
     RAW_INGEST_STAGE,
-    run_raw_ingestion,
+    run_raw_ingest_stage,
 )
 from .wikitionary.downloader import DEFAULT_WIKTIONARY_URL, download_wiktionary_dump
 from .wikitionary.extract import extract_wiktionary_dump
@@ -109,12 +110,15 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
 
     with get_connection(settings) as conn:
-        applied = apply_foundation(conn)
+        applied_versions = apply_foundation(conn)
 
-    if applied:
-        print(f"Applied database foundation {FOUNDATION_VERSION}")
+    if applied_versions:
+        print(
+            "Applied database migrations: "
+            + ", ".join(applied_versions)
+        )
     else:
-        print(f"Database foundation {FOUNDATION_VERSION} is already applied")
+        print(f"Database foundation {LATEST_FOUNDATION_VERSION} is already applied")
     return 0
 
 
@@ -273,17 +277,19 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
 
     try:
-        result = run_raw_ingestion(
+        result = run_raw_ingest_stage(
             settings=settings,
             workdir=args.workdir,
-            url=args.url,
+            source_url=(
+                args.source_url or DEFAULT_WIKTIONARY_SOURCE_URL
+                if args.archive_path is None
+                else None
+            ),
+            archive_path=args.archive_path,
             target_table=args.target_table,
             overwrite_download=args.overwrite_download,
-            overwrite_extract=args.overwrite_extract,
-            skip_download=args.skip_download,
-            skip_extract=args.skip_extract,
         )
-    except (FileNotFoundError, JsonlProcessingError) as exc:
+    except FileNotFoundError as exc:
         args._parser.error(str(exc))
     except RuntimeError as exc:  # pragma: no cover - network failure guard
         args._parser.error(str(exc))
@@ -296,6 +302,8 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
         f"run_id={result.run_id} "
         f"snapshot_id={result.snapshot_id} "
         f"rows_loaded={result.rows_loaded} "
+        f"anomalies_logged={result.anomalies_logged} "
+        f"snapshot_preexisting={result.snapshot_preexisting} "
         f"archive_sha256={result.archive_sha256}"
     )
     return 0
@@ -525,10 +533,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("data/raw"),
         help="Working directory for archive and extracted JSONL files (default: %(default)s).",
     )
-    raw_ingest_parser.add_argument(
-        "--url",
-        default=DEFAULT_WIKTIONARY_URL,
-        help="Source URL for the Wiktionary dump (default: official raw dataset).",
+    source_group = raw_ingest_parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--source-url",
+        help="Source URL for the Wiktionary snapshot (default: official raw dataset).",
+    )
+    source_group.add_argument(
+        "--archive-path",
+        type=Path,
+        help="Use an existing local .jsonl or .jsonl.gz archive instead of downloading.",
     )
     raw_ingest_parser.add_argument(
         "--target-table",
@@ -538,22 +551,7 @@ def _build_parser() -> argparse.ArgumentParser:
     raw_ingest_parser.add_argument(
         "--overwrite-download",
         action="store_true",
-        help="Force re-download even if the archive already exists.",
-    )
-    raw_ingest_parser.add_argument(
-        "--overwrite-extract",
-        action="store_true",
-        help="Force re-extraction even if the JSONL file already exists.",
-    )
-    raw_ingest_parser.add_argument(
-        "--skip-download",
-        action="store_true",
-        help="Reuse an existing archive in workdir instead of downloading it.",
-    )
-    raw_ingest_parser.add_argument(
-        "--skip-extract",
-        action="store_true",
-        help="Reuse an existing extracted JSONL file in workdir instead of extracting it.",
+        help="Force re-download or overwrite an acquired archive in workdir.",
     )
     _add_database_options(raw_ingest_parser)
     raw_ingest_parser.set_defaults(func=_cmd_raw_ingest, _parser=raw_ingest_parser)
