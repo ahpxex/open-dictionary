@@ -3,55 +3,143 @@ from __future__ import annotations
 from typing import Any
 
 
-def validate_enrichment_payload(payload: dict[str, Any], *, expected_pos: set[str]) -> dict[str, Any]:
+def build_expected_generation_targets(entry_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for group in entry_payload.get("pos_groups", []):
+        pos = str(group.get("pos") or "").strip()
+        if not pos:
+            continue
+        sense_ids = []
+        for sense in group.get("senses", []):
+            sense_id = str(sense.get("sense_id") or "").strip()
+            if sense_id:
+                sense_ids.append(sense_id)
+        targets.append({"pos": pos, "sense_ids": sense_ids})
+    return targets
+
+
+def validate_enrichment_payload(
+    payload: dict[str, Any],
+    *,
+    expected_pos_targets: list[dict[str, Any]],
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("LLM payload must be a JSON object")
 
-    required = {"overview", "etymology_story", "study_notes", "pos_summaries"}
+    required = {"headword_summary", "study_notes", "etymology_note", "pos_groups"}
     missing = required - payload.keys()
     if missing:
         raise ValueError(f"LLM payload is missing required keys: {sorted(missing)}")
 
-    if not isinstance(payload["overview"], str) or not payload["overview"].strip():
-        raise ValueError("LLM payload overview must be a non-empty string")
-    if payload["etymology_story"] == "":
-        payload["etymology_story"] = None
-    if payload["etymology_story"] is not None and not isinstance(payload["etymology_story"], str):
-        raise ValueError("LLM payload etymology_story must be a string or null")
-    if isinstance(payload["study_notes"], str):
-        payload["study_notes"] = [payload["study_notes"]]
-    if not isinstance(payload["study_notes"], list) or not all(isinstance(item, str) for item in payload["study_notes"]):
-        raise ValueError("LLM payload study_notes must be a string array")
-    if not isinstance(payload["pos_summaries"], list):
-        raise ValueError("LLM payload pos_summaries must be an array")
+    if not isinstance(payload["headword_summary"], str) or not payload["headword_summary"].strip():
+        raise ValueError("LLM payload headword_summary must be a non-empty string")
 
-    normalized_pos = set()
-    for item in payload["pos_summaries"]:
+    payload["study_notes"] = _normalize_string_list(payload["study_notes"], field_name="study_notes")
+    payload["etymology_note"] = _normalize_optional_text(payload["etymology_note"], field_name="etymology_note")
+
+    pos_groups = payload["pos_groups"]
+    if not isinstance(pos_groups, list):
+        raise ValueError("LLM payload pos_groups must be an array")
+
+    expected_pos_index = {item["pos"].strip().casefold(): item for item in expected_pos_targets}
+    normalized_pos_groups: dict[str, dict[str, Any]] = {}
+
+    for item in pos_groups:
         if not isinstance(item, dict):
-            raise ValueError("Each pos_summaries item must be an object")
-        for field in ("pos", "learner_summary", "usage_notes", "flags"):
+            raise ValueError("Each pos_groups item must be an object")
+        for field in ("pos", "summary", "usage_notes", "meanings"):
             if field not in item:
-                raise ValueError(f"pos_summaries item is missing {field}")
-        if not isinstance(item["pos"], str) or not item["pos"].strip():
-            raise ValueError("pos_summaries.pos must be a non-empty string")
-        if not isinstance(item["learner_summary"], str):
-            raise ValueError("pos_summaries.learner_summary must be a string")
-        if isinstance(item["usage_notes"], list):
-            if not all(isinstance(part, str) for part in item["usage_notes"]):
-                raise ValueError("pos_summaries.usage_notes must be a string or null")
-            item["usage_notes"] = " ".join(part.strip() for part in item["usage_notes"] if part.strip()) or None
-        if item["usage_notes"] is not None and not isinstance(item["usage_notes"], str):
-            raise ValueError("pos_summaries.usage_notes must be a string or null")
-        if item["flags"] is None:
-            item["flags"] = []
-        elif isinstance(item["flags"], str):
-            item["flags"] = [item["flags"]]
-        if not isinstance(item["flags"], list) or not all(isinstance(flag, str) for flag in item["flags"]):
-            raise ValueError("pos_summaries.flags must be a string array")
-        normalized_pos.add(item["pos"].strip().casefold())
+                raise ValueError(f"pos_groups item is missing {field}")
 
-    unexpected_pos = normalized_pos - expected_pos
-    if unexpected_pos:
-        raise ValueError(f"LLM payload contains unexpected pos summaries: {sorted(unexpected_pos)}")
+        pos = str(item["pos"] or "").strip()
+        if not pos:
+            raise ValueError("pos_groups.pos must be a non-empty string")
+        pos_key = pos.casefold()
+        if pos_key in normalized_pos_groups:
+            raise ValueError(f"LLM payload contains duplicate pos group: {pos}")
+        if pos_key not in expected_pos_index:
+            raise ValueError(f"LLM payload contains unexpected pos groups: {[pos]}")
 
+        if not isinstance(item["summary"], str) or not item["summary"].strip():
+            raise ValueError("pos_groups.summary must be a non-empty string")
+        item["usage_notes"] = _normalize_optional_text(item["usage_notes"], field_name="pos_groups.usage_notes")
+        item["meanings"] = _validate_meanings(
+            item["meanings"],
+            expected_sense_ids=expected_pos_index[pos_key]["sense_ids"],
+            pos=pos,
+        )
+        normalized_pos_groups[pos_key] = item
+
+    missing_pos = [item["pos"] for item in expected_pos_targets if item["pos"].strip().casefold() not in normalized_pos_groups]
+    if missing_pos:
+        raise ValueError(f"LLM payload is missing pos groups: {missing_pos}")
+
+    payload["pos_groups"] = [
+        normalized_pos_groups[item["pos"].strip().casefold()]
+        for item in expected_pos_targets
+    ]
     return payload
+
+
+def _validate_meanings(
+    meanings: Any,
+    *,
+    expected_sense_ids: list[str],
+    pos: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(meanings, list):
+        raise ValueError("pos_groups.meanings must be an array")
+
+    expected_index = {sense_id: idx for idx, sense_id in enumerate(expected_sense_ids)}
+    normalized_meanings: dict[str, dict[str, Any]] = {}
+
+    for item in meanings:
+        if not isinstance(item, dict):
+            raise ValueError("Each meanings item must be an object")
+        for field in ("sense_id", "short_gloss", "learner_explanation", "usage_note"):
+            if field not in item:
+                raise ValueError(f"meanings item is missing {field}")
+
+        sense_id = str(item["sense_id"] or "").strip()
+        if not sense_id:
+            raise ValueError("meanings.sense_id must be a non-empty string")
+        if sense_id in normalized_meanings:
+            raise ValueError(f"LLM payload contains duplicate sense_id in pos {pos}: {sense_id}")
+        if sense_id not in expected_index:
+            raise ValueError(f"LLM payload contains unexpected sense_id in pos {pos}: {sense_id}")
+
+        item["short_gloss"] = _normalize_optional_text(item["short_gloss"], field_name="meanings.short_gloss")
+        if not isinstance(item["learner_explanation"], str) or not item["learner_explanation"].strip():
+            raise ValueError("meanings.learner_explanation must be a non-empty string")
+        item["usage_note"] = _normalize_optional_text(item["usage_note"], field_name="meanings.usage_note")
+        normalized_meanings[sense_id] = item
+
+    missing_sense_ids = [sense_id for sense_id in expected_sense_ids if sense_id not in normalized_meanings]
+    if missing_sense_ids:
+        raise ValueError(f"LLM payload is missing sense_ids in pos {pos}: {missing_sense_ids}")
+
+    return [normalized_meanings[sense_id] for sense_id in expected_sense_ids]
+
+
+def _normalize_optional_text(value: Any, *, field_name: str) -> str | None:
+    if value == "":
+        return None
+    if isinstance(value, list):
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError(f"{field_name} must be a string or null")
+        joined = " ".join(item.strip() for item in value if item.strip())
+        return joined or None
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    stripped = value.strip()
+    return stripped or None
+
+
+def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{field_name} must be a string array")
+    return [item.strip() for item in value if item.strip()]

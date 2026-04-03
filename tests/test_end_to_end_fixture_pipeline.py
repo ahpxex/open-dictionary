@@ -18,30 +18,38 @@ class FixtureAwareFakeLLMClient:
 
     def generate_json(self, *, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
         self.calls += 1
-        marker = "Curated entry payload:\n"
+        marker = "Generated-field source payload:\n"
         payload = json.loads(user_prompt.split(marker, 1)[1])
-        pos_summaries = []
+        pos_groups = []
         for group in payload.get("pos_groups", []):
-            pos_summaries.append(
+            pos_groups.append(
                 {
                     "pos": group["pos"],
-                    "learner_summary": f"Learner summary for {group['pos']}",
+                    "summary": f"{group['pos']} 的整体说明。",
                     "usage_notes": None,
-                    "flags": [],
+                    "meanings": [
+                        {
+                            "sense_id": meaning["sense_id"],
+                            "short_gloss": f"{meaning['sense_id']} short gloss",
+                            "learner_explanation": f"{meaning['sense_id']} 的详细中文解释。",
+                            "usage_note": None,
+                        }
+                        for meaning in group.get("meanings", [])
+                    ],
                 }
             )
         response = {
-            "overview": f"Overview for {payload['word']}",
-            "etymology_story": None,
-            "study_notes": [f"Study {payload['word']} carefully."],
-            "pos_summaries": pos_summaries,
+            "headword_summary": f"{payload['headword']} 的整体中文说明。",
+            "etymology_note": None,
+            "study_notes": [f"学习 {payload['headword']} 时要注意语境。"],
+            "pos_groups": pos_groups,
         }
         return json.dumps(response, ensure_ascii=False)
 
 
 def test_fixture_pipeline_runs_end_to_end_with_fake_llm(tmp_path: Path, temp_database_url: str) -> None:
     # This case drives the full rewritten pipeline over the repository fixture:
-    # raw ingest -> curated build -> llm enrich -> export jsonl.
+    # raw ingest -> curated build -> llm enrich -> audit jsonl export.
     env_file = tmp_path / ".env"
     env_file.write_text(
         "LLM_API=http://localhost:3888/v1\nLLM_KEY=EMPTY\nLLM_MODEL=test-model\n",
@@ -49,7 +57,7 @@ def test_fixture_pipeline_runs_end_to_end_with_fake_llm(tmp_path: Path, temp_dat
     )
     settings = RuntimeSettings(database_url=temp_database_url)
     fixture_path = Path("fixtures/wiktionary/raw.jsonl")
-    output_path = tmp_path / "final.jsonl"
+    output_path = tmp_path / "audit.jsonl"
     fake_client = FixtureAwareFakeLLMClient()
 
     with get_connection(settings) as conn:
@@ -87,7 +95,7 @@ def test_fixture_pipeline_export_rows_contain_curated_and_llm_sections(
     tmp_path: Path,
     temp_database_url: str,
 ) -> None:
-    # This case verifies the shape of final exported documents produced by the
+    # This case verifies the shape of the merged audit documents produced by the
     # rewritten end-to-end fixture pipeline.
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -96,7 +104,7 @@ def test_fixture_pipeline_export_rows_contain_curated_and_llm_sections(
     )
     settings = RuntimeSettings(database_url=temp_database_url)
     fixture_path = Path("fixtures/wiktionary/raw.jsonl")
-    output_path = tmp_path / "final.jsonl"
+    output_path = tmp_path / "audit.jsonl"
 
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -124,4 +132,4 @@ def test_fixture_pipeline_export_rows_contain_curated_and_llm_sections(
     assert "curated" in first_doc
     assert "llm" in first_doc
     assert "pos_groups" in first_doc["curated"]
-    assert "overview" in first_doc["llm"]["payload"]
+    assert "headword_summary" in first_doc["llm"]["payload"]

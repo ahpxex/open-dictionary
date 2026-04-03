@@ -22,7 +22,10 @@ from .stages.curated_build import (
     DEFAULT_CURATED_TABLE,
     run_curated_build_stage,
 )
-from .stages.export_jsonl import EXPORT_JSONL_STAGE, run_export_jsonl_stage
+from .stages.export_jsonl import (
+    EXPORT_AUDIT_JSONL_STAGE,
+    run_export_audit_jsonl_stage,
+)
 from .stages.llm_enrich import LLM_ENRICH_STAGE, run_llm_enrich_stage
 from .stages.raw_ingest import DEFAULT_RAW_TABLE, RAW_INGEST_STAGE, run_raw_ingest_stage
 
@@ -137,11 +140,11 @@ def _cmd_llm_enrich(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_export_jsonl(args: argparse.Namespace) -> int:
+def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
 
     try:
-        result = run_export_jsonl_stage(
+        result = run_export_audit_jsonl_stage(
             settings=settings,
             output_path=args.output,
             curated_table=args.curated_table,
@@ -154,9 +157,16 @@ def _cmd_export_jsonl(args: argparse.Namespace) -> int:
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
 
+    if getattr(args, "command", None) == "export-jsonl":
+        print(
+            "Warning: export-jsonl is a deprecated alias. "
+            "Use export-audit-jsonl for the merged audit artifact.",
+            file=sys.stderr,
+        )
+
     print(
-        "JSONL export completed "
-        f"stage={EXPORT_JSONL_STAGE} "
+        "Audit JSONL export completed "
+        f"stage={EXPORT_AUDIT_JSONL_STAGE} "
         f"run_id={result.run_id} "
         f"entry_count={result.entry_count} "
         f"output_path={result.output_path} "
@@ -316,46 +326,93 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_database_options(llm_enrich_parser)
     llm_enrich_parser.set_defaults(func=_cmd_llm_enrich, _parser=llm_enrich_parser)
 
-    export_jsonl_parser = subparsers.add_parser(
-        "export-jsonl",
-        help="Export curated entries and optional LLM enrichments into a merged JSONL artifact.",
+    export_audit_jsonl_parser = subparsers.add_parser(
+        "export-audit-jsonl",
+        help="Export the current merged curated+LLM audit artifact as JSONL.",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/export/final.jsonl"),
+        default=Path("data/export/audit.jsonl"),
         help="Output JSONL path (default: %(default)s).",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--curated-table",
         default="curated.entries",
         help="Source curated entries table (default: %(default)s).",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--llm-table",
         default="llm.entry_enrichments",
         help="Source LLM enrichments table (default: %(default)s).",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--artifact-table",
         default="export.artifacts",
         help="Export artifact metadata table (default: %(default)s).",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--model",
         help="Optional model filter when choosing the latest successful enrichment.",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--prompt-version",
         help="Optional prompt version filter when choosing the latest successful enrichment.",
     )
-    export_jsonl_parser.add_argument(
+    export_audit_jsonl_parser.add_argument(
         "--include-unenriched",
         action="store_true",
         help="Include curated entries even when no successful enrichment exists.",
     )
-    _add_database_options(export_jsonl_parser)
-    export_jsonl_parser.set_defaults(func=_cmd_export_jsonl, _parser=export_jsonl_parser)
+    _add_database_options(export_audit_jsonl_parser)
+    export_audit_jsonl_parser.set_defaults(
+        func=_cmd_export_audit_jsonl,
+        _parser=export_audit_jsonl_parser,
+    )
+
+    export_jsonl_alias_parser = subparsers.add_parser(
+        "export-jsonl",
+        help="Deprecated alias for export-audit-jsonl.",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/export/audit.jsonl"),
+        help="Output JSONL path (default: %(default)s).",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--curated-table",
+        default="curated.entries",
+        help="Source curated entries table (default: %(default)s).",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--llm-table",
+        default="llm.entry_enrichments",
+        help="Source LLM enrichments table (default: %(default)s).",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--artifact-table",
+        default="export.artifacts",
+        help="Export artifact metadata table (default: %(default)s).",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--model",
+        help="Optional model filter when choosing the latest successful enrichment.",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--prompt-version",
+        help="Optional prompt version filter when choosing the latest successful enrichment.",
+    )
+    export_jsonl_alias_parser.add_argument(
+        "--include-unenriched",
+        action="store_true",
+        help="Include curated entries even when no successful enrichment exists.",
+    )
+    _add_database_options(export_jsonl_alias_parser)
+    export_jsonl_alias_parser.set_defaults(
+        func=_cmd_export_audit_jsonl,
+        _parser=export_jsonl_alias_parser,
+    )
 
     download_parser = subparsers.add_parser(
         "download",

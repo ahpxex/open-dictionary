@@ -15,10 +15,16 @@ from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
 from open_dictionary.llm.config import load_llm_settings
-from open_dictionary.llm.prompt import OUTPUT_CONTRACT, PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
+from open_dictionary.llm.prompt import (
+    OUTPUT_CONTRACT,
+    PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    build_generation_source_payload,
+    build_user_prompt,
+)
 from open_dictionary.pipeline import complete_run, fail_run, start_run
 
-from .schema import validate_enrichment_payload
+from .schema import build_expected_generation_targets, validate_enrichment_payload
 
 
 LLM_ENRICH_STAGE = "llm.enrich"
@@ -199,7 +205,10 @@ def iter_curated_entries(
         with conn.cursor() as cursor:
             cursor.execute(query, params)
             for entry_id, payload in cursor.fetchall():
-                request_payload = {"entry": payload, "prompt_version": prompt_version}
+                request_payload = {
+                    "entry": build_generation_source_payload(payload),
+                    "prompt_version": prompt_version,
+                }
                 yield {
                     "entry_id": entry_id,
                     "payload": payload,
@@ -218,8 +227,8 @@ def enrich_one_entry(
 ) -> dict[str, Any]:
     request_payload = entry["request_payload"]
     input_hash = entry["input_hash"]
-    expected_pos = {group["pos"] for group in entry["payload"].get("pos_groups", [])}
-    user_prompt = build_user_prompt(entry["payload"])
+    expected_pos_targets = build_expected_generation_targets(entry["payload"])
+    user_prompt = build_user_prompt(request_payload["entry"])
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
@@ -230,7 +239,10 @@ def enrich_one_entry(
                 temperature=0.0,
             )
             response_payload = json.loads(raw_response)
-            validated = validate_enrichment_payload(response_payload, expected_pos=expected_pos)
+            validated = validate_enrichment_payload(
+                response_payload,
+                expected_pos_targets=expected_pos_targets,
+            )
             return {
                 "entry_id": entry["entry_id"],
                 "model": model,

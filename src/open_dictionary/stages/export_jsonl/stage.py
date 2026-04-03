@@ -15,7 +15,10 @@ from open_dictionary.db.connection import get_connection
 from open_dictionary.pipeline import complete_run, fail_run, start_run
 
 
-EXPORT_JSONL_STAGE = "export.jsonl"
+EXPORT_AUDIT_JSONL_STAGE = "export.audit_jsonl"
+# Backward-compatible alias while the CLI migrates away from the ambiguous
+# export-jsonl naming.
+EXPORT_JSONL_STAGE = EXPORT_AUDIT_JSONL_STAGE
 
 
 @dataclass(frozen=True)
@@ -40,7 +43,7 @@ def run_export_jsonl_stage(
     with get_connection(settings) as conn:
         run_id = start_run(
             conn,
-            stage=EXPORT_JSONL_STAGE,
+            stage=EXPORT_AUDIT_JSONL_STAGE,
             config={
                 "output_path": str(output_path),
                 "curated_table": curated_table,
@@ -49,6 +52,7 @@ def run_export_jsonl_stage(
                 "model": model,
                 "prompt_version": prompt_version,
                 "include_unenriched": include_unenriched,
+                "artifact_role": "audit",
             },
         )
 
@@ -76,6 +80,7 @@ def run_export_jsonl_stage(
                     "model": model,
                     "prompt_version": prompt_version,
                     "include_unenriched": include_unenriched,
+                    "artifact_role": "audit",
                 },
             )
             complete_run(
@@ -225,7 +230,7 @@ def record_export_artifact(
             ).format(artifact_identifier),
             (
                 run_id,
-                "jsonl",
+                "audit_jsonl",
                 str(output_path),
                 output_sha256,
                 entry_count,
@@ -233,6 +238,10 @@ def record_export_artifact(
             ),
         )
     conn.commit()
+
+
+def run_export_audit_jsonl_stage(**kwargs) -> ExportJSONLResult:
+    return run_export_jsonl_stage(**kwargs)
 
 
 def identifier_from_dotted(qualified_name: str) -> sql.Identifier:

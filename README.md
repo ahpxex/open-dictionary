@@ -103,26 +103,33 @@ This stage writes to:
 - `llm.prompt_versions`
 - `llm.entry_enrichments`
 
-## Export Final JSONL
+## Export Audit JSONL
 
-Export curated entries and their latest successful enrichments into one merged
-JSONL artifact:
+Export the current merged curated-plus-LLM audit artifact:
 
 ```bash
-uv run open-dictionary export-jsonl --output data/export/final.jsonl
+uv run open-dictionary export-audit-jsonl --output data/export/audit.jsonl
 ```
 
 Useful flags:
 
 ```bash
-uv run open-dictionary export-jsonl --include-unenriched
-uv run open-dictionary export-jsonl --model Qwen/Qwen3.5-122B-A10B-FP8
-uv run open-dictionary export-jsonl --prompt-version curated_v1_enrichment_v1
+uv run open-dictionary export-audit-jsonl --include-unenriched
+uv run open-dictionary export-audit-jsonl --model Qwen/Qwen3.5-122B-A10B-FP8
+uv run open-dictionary export-audit-jsonl --prompt-version curated_v1_distribution_fields_v1
 ```
 
 This stage records metadata in:
 
 - `export.artifacts`
+
+Important:
+
+- this audit artifact is not the final learner-facing distribution contract
+- it intentionally preserves the internal `curated` and `llm` stage split for
+  debugging, replay, and auditability
+- the future final distribution JSONL must flatten those stage payloads into a
+  product-facing schema
 
 ## Optional Snapshot Utilities
 
@@ -141,4 +148,5 @@ uv run open-dictionary extract \
 ```
 
 The rewrite pipeline itself should use `raw-ingest`, `curated-build`,
-`llm-enrich`, and `export-jsonl` rather than the legacy table-mutation workflow.
+`llm-enrich`, and `export-audit-jsonl` rather than the legacy table-mutation
+workflow.

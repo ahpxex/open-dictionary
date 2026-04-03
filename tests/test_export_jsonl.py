@@ -88,8 +88,8 @@ def seed_llm_enrichment(
                 prompt_version,
                 f"hash-{entry_id}-{model}-{prompt_version}-{created_offset}",
                 status,
-                json.dumps(payload or {"overview": "overview"}),
-                json.dumps(payload or {"overview": "overview"}),
+                json.dumps(payload or {"headword_summary": "headword summary"}),
+                json.dumps(payload or {"headword_summary": "headword summary"}),
                 created_offset,
                 created_offset,
             ),
@@ -127,7 +127,7 @@ def test_identifier_from_dotted_rejects_blank_names() -> None:
 
 
 def test_iter_export_documents_includes_llm_payload_when_present(temp_database_url: str) -> None:
-    # This case verifies the merged document shape on the happy path.
+    # This case verifies the merged audit document shape on the happy path.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -171,7 +171,7 @@ def test_iter_export_documents_can_include_unenriched_entries(temp_database_url:
 
 
 def test_iter_export_documents_can_exclude_unenriched_entries(temp_database_url: str) -> None:
-    # This case supports a strict "only fully enriched rows" export mode.
+    # This case supports a strict audit export mode that excludes unenriched rows.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -240,8 +240,8 @@ def test_iter_export_documents_selects_latest_successful_enrichment(temp_databas
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn, word="cat")
-        seed_llm_enrichment(conn, entry_id=entry_id, created_offset=0, payload={"overview": "old"})
-        seed_llm_enrichment(conn, entry_id=entry_id, created_offset=5, payload={"overview": "new"})
+        seed_llm_enrichment(conn, entry_id=entry_id, created_offset=0, payload={"headword_summary": "old"})
+        seed_llm_enrichment(conn, entry_id=entry_id, created_offset=5, payload={"headword_summary": "new"})
         conn.commit()
 
     docs = list(export_stage.iter_export_documents(
@@ -253,16 +253,16 @@ def test_iter_export_documents_selects_latest_successful_enrichment(temp_databas
         include_unenriched=False,
     ))
 
-    assert docs[0]["llm"]["payload"]["overview"] == "new"
+    assert docs[0]["llm"]["payload"]["headword_summary"] == "new"
 
 
 def test_iter_export_documents_ignores_failed_enrichments(temp_database_url: str) -> None:
-    # This case prevents broken LLM rows from leaking into the final artifact.
+    # This case prevents broken LLM rows from leaking into the audit artifact.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn, word="cat")
-        seed_llm_enrichment(conn, entry_id=entry_id, status="failed", payload={"overview": "bad"})
+        seed_llm_enrichment(conn, entry_id=entry_id, status="failed", payload={"headword_summary": "bad"})
         conn.commit()
 
     docs = list(export_stage.iter_export_documents(
@@ -308,7 +308,7 @@ def test_record_export_artifact_persists_metadata(temp_database_url: str, tmp_pa
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
-        run_id = start_run(conn, stage="export.jsonl")
+        run_id = start_run(conn, stage="export.audit_jsonl")
         export_stage.record_export_artifact(
             conn,
             artifact_table="export.artifacts",
@@ -322,15 +322,15 @@ def test_record_export_artifact_persists_metadata(temp_database_url: str, tmp_pa
             cursor.execute("select artifact_type, entry_count, metadata->>'model' from export.artifacts")
             artifact_type, entry_count, model = cursor.fetchone()
 
-    assert artifact_type == "jsonl"
+    assert artifact_type == "audit_jsonl"
     assert entry_count == 3
     assert model == "test-model"
 
 
 def test_run_export_jsonl_stage_writes_output_and_manifest(temp_database_url: str, tmp_path: Path) -> None:
-    # This case covers the end-to-end export path with both curated and LLM content present.
+    # This case covers the end-to-end audit export path with both curated and LLM content present.
     settings = RuntimeSettings(database_url=temp_database_url)
-    output = tmp_path / "final.jsonl"
+    output = tmp_path / "audit.jsonl"
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn, word="cat")
@@ -345,9 +345,9 @@ def test_run_export_jsonl_stage_writes_output_and_manifest(temp_database_url: st
 
 
 def test_run_export_jsonl_stage_can_emit_only_enriched_entries(temp_database_url: str, tmp_path: Path) -> None:
-    # This case exercises the strict export path where unenriched entries are suppressed.
+    # This case exercises the strict audit export path where unenriched entries are suppressed.
     settings = RuntimeSettings(database_url=temp_database_url)
-    output = tmp_path / "final.jsonl"
+    output = tmp_path / "audit.jsonl"
     with get_connection(settings) as conn:
         apply_foundation(conn)
         seed_curated_entry(conn, word="cat")
@@ -364,9 +364,9 @@ def test_run_export_jsonl_stage_can_emit_only_enriched_entries(temp_database_url
 
 
 def test_run_export_jsonl_stage_records_pipeline_run_success(temp_database_url: str, tmp_path: Path) -> None:
-    # This case verifies export runs are visible in pipeline metadata.
+    # This case verifies audit export runs are visible in pipeline metadata.
     settings = RuntimeSettings(database_url=temp_database_url)
-    output = tmp_path / "final.jsonl"
+    output = tmp_path / "audit.jsonl"
     with get_connection(settings) as conn:
         apply_foundation(conn)
         seed_curated_entry(conn, word="cat")
@@ -387,9 +387,9 @@ def test_run_export_jsonl_stage_marks_run_failed_when_write_crashes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This case ensures export failures do not leave ambiguous running pipeline rows.
+    # This case ensures audit export failures do not leave ambiguous running pipeline rows.
     settings = RuntimeSettings(database_url=temp_database_url)
-    output = tmp_path / "final.jsonl"
+    output = tmp_path / "audit.jsonl"
     with get_connection(settings) as conn:
         apply_foundation(conn)
         seed_curated_entry(conn, word="cat")
@@ -403,7 +403,7 @@ def test_run_export_jsonl_stage_marks_run_failed_when_write_crashes(
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "select status, error from meta.pipeline_runs where stage = 'export.jsonl' order by started_at desc limit 1"
+                "select status, error from meta.pipeline_runs where stage = 'export.audit_jsonl' order by started_at desc limit 1"
             )
             status, error = cursor.fetchone()
 
@@ -412,7 +412,7 @@ def test_run_export_jsonl_stage_marks_run_failed_when_write_crashes(
 
 
 def test_run_export_jsonl_stage_sha_changes_with_content(temp_database_url: str, tmp_path: Path) -> None:
-    # This case makes the artifact hash meaningful by verifying different exports produce different digests.
+    # This case makes the audit artifact hash meaningful by verifying different exports produce different digests.
     settings = RuntimeSettings(database_url=temp_database_url)
     output_one = tmp_path / "one.jsonl"
     output_two = tmp_path / "two.jsonl"
@@ -433,7 +433,7 @@ def test_run_export_jsonl_stage_sha_changes_with_content(temp_database_url: str,
 
 
 def test_export_document_contains_expected_top_level_keys(temp_database_url: str) -> None:
-    # This case locks in the merged document contract for downstream consumers.
+    # This case locks in the merged audit document contract for downstream consumers.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -453,7 +453,7 @@ def test_export_document_contains_expected_top_level_keys(temp_database_url: str
 
 
 def test_export_document_uses_null_llm_when_missing(temp_database_url: str) -> None:
-    # This case makes the missing-enrichment shape explicit in the exported JSONL.
+    # This case makes the missing-enrichment shape explicit in the audit JSONL.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -473,7 +473,7 @@ def test_export_document_uses_null_llm_when_missing(temp_database_url: str) -> N
 
 
 def test_export_document_embeds_curated_payload_verbatim(temp_database_url: str) -> None:
-    # This case protects curated content from being silently reshaped during export.
+    # This case protects curated content from being silently reshaped during audit export.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -494,7 +494,7 @@ def test_export_document_embeds_curated_payload_verbatim(temp_database_url: str)
 
 
 def test_write_jsonl_atomic_produces_one_line_per_document(tmp_path: Path) -> None:
-    # This case ensures the export helper always emits valid JSON Lines rather than one giant JSON blob.
+    # This case ensures the audit export helper always emits valid JSON Lines rather than one giant JSON blob.
     output = tmp_path / "out.jsonl"
     export_stage.write_jsonl_atomic(output, [{"word": "cat"}, {"word": "dog"}])
 
@@ -502,7 +502,7 @@ def test_write_jsonl_atomic_produces_one_line_per_document(tmp_path: Path) -> No
 
 
 def test_iter_export_documents_returns_empty_when_no_curated_rows_exist(temp_database_url: str) -> None:
-    # This case protects the empty-database export path.
+    # This case protects the empty-database audit export path.
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
@@ -524,7 +524,7 @@ def test_record_export_artifact_tracks_entry_count(temp_database_url: str, tmp_p
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
-        run_id = start_run(conn, stage="export.jsonl")
+        run_id = start_run(conn, stage="export.audit_jsonl")
         export_stage.record_export_artifact(
             conn,
             artifact_table="export.artifacts",
@@ -542,9 +542,9 @@ def test_record_export_artifact_tracks_entry_count(temp_database_url: str, tmp_p
 
 
 def test_run_export_jsonl_stage_manifest_matches_file_line_count(temp_database_url: str, tmp_path: Path) -> None:
-    # This case ensures metadata and emitted artifact content stay in sync.
+    # This case ensures audit artifact metadata and emitted content stay in sync.
     settings = RuntimeSettings(database_url=temp_database_url)
-    output = tmp_path / "final.jsonl"
+    output = tmp_path / "audit.jsonl"
     with get_connection(settings) as conn:
         apply_foundation(conn)
         seed_curated_entry(conn, word="cat")
