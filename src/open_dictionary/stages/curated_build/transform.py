@@ -30,15 +30,6 @@ MAX_RELATIONS_PER_TYPE = 24
 
 
 @dataclass(frozen=True)
-class RawRecordRef:
-    raw_record_id: int
-    snapshot_id: str
-    run_id: str
-    source_line: int
-    pos: str | None
-
-
-@dataclass(frozen=True)
 class TriageItem:
     lang_code: str | None
     word: str | None
