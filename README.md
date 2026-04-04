@@ -1,26 +1,64 @@
-# Open English Dictionary
+# Open Dictionary
 
-## Rebuilding process WIP
+Open Dictionary is a staged dictionary-production pipeline built on top of
+Wiktionary / Wiktextract data.
 
-## Currently, this project is being rebuilt.
+The current rewrite line is PostgreSQL-first and contract-driven:
 
-New features are:
-
-- Explicit rewrite foundation with tracked pipeline runs
-- PostgreSQL-first raw ingestion for Wiktionary / Wiktextract snapshots
-- Streamlined raw ingestion and curation rewrite
-- Wiktionary grounding
-  - Enormous words data across multiple languages
-- New distribution format will be: jsonl, sqlite and more are to be determined
-- Options are available to select specific category of words
-
-**Behold and stay tuned!**
+- raw source snapshots are ingested into tracked PostgreSQL tables
+- curated entries are assembled as word-centric learner-entry skeletons
+- LLM enrichment generates Chinese learner-facing explanatory fields
+- final read-only artifacts are exported as distribution JSONL and audit JSONL
 
 ## Prerequisites
 
 - Install project dependencies: `uv sync`
 - Configure a `.env` file with `DATABASE_URL`
 - Ensure a PostgreSQL database is reachable via that URL
+- Configure an LLM env file with `LLM_API`, `LLM_KEY`, and `LLM_MODEL` when
+  running `llm-enrich` or any pipeline command that reaches the LLM stage
+
+## Pipeline Flow
+
+The rewrite pipeline is explicitly staged:
+
+```text
+database foundation
+  -> db-init
+
+source snapshot acquisition
+  -> raw-ingest
+
+raw PostgreSQL rows
+  -> curated-build
+
+curated learner-entry skeletons
+  -> llm-enrich
+
+curated structure + generated explanations
+  -> export-distribution-jsonl
+  -> validate-distribution-jsonl
+
+optional debug artifact
+  -> export-audit-jsonl
+```
+
+The one-command wrapper for this flow is `pipeline-run`, which still calls the
+stage contracts in order instead of hiding them behind implicit side effects.
+
+## CLI Conventions
+
+All CLI commands now follow the same output conventions:
+
+- `stdout`: one structured JSON result object
+- `stderr`: progress events and warnings
+
+Example progress lines:
+
+```text
+[progress] stage=llm.enrich event=enrich_progress processed=150 queued_entries=742 succeeded=150 failed=0
+[progress] stage=export.distribution_jsonl.validate event=validate_complete validated_entries=741
+```
 
 ## Initialize The Rewrite Foundation
 
@@ -34,31 +72,39 @@ This creates the initial `meta`, `raw`, `curated`, `llm`, and `export` schemas.
 
 ## Run The Full Pipeline
 
-Run the staged pipeline from one CLI command:
-
-```bash
-uv run open-dictionary pipeline-run \
-  --archive-path fixtures/wiktionary/raw.jsonl \
-  --distribution-output data/export/distribution.jsonl
-```
-
-Useful flags:
+Run the full staged pipeline from one CLI command:
 
 ```bash
 uv run open-dictionary pipeline-run \
   --archive-path fixtures/wiktionary/raw.jsonl \
   --llm-env-file .env \
-  --max-workers 50 \
-  --audit-output data/export/audit.jsonl
+  --distribution-output data/export/distribution.jsonl \
+  --validate-distribution
 ```
 
-This command still runs the explicit stage contracts in order:
+Recommended real-model run with adaptive concurrency tiers and both export
+artifacts:
 
-- `raw-ingest`
-- `curated-build`
-- `llm-enrich`
-- `export-distribution-jsonl`
-- optional `export-audit-jsonl`
+```bash
+uv run open-dictionary pipeline-run \
+  --archive-path fixtures/wiktionary/raw.jsonl \
+  --llm-env-file .env \
+  --worker-tiers 50 12 4 1 \
+  --distribution-output data/export/distribution.jsonl \
+  --audit-output data/export/audit.jsonl \
+  --validate-distribution
+```
+
+Useful pipeline flags:
+
+- `--skip-db-init`
+- `--lang-codes en zh`
+- `--limit-groups 100`
+- `--limit-entries 50`
+- `--worker-tiers 50 12 4 1`
+- `--distribution-output data/export/distribution.jsonl`
+- `--audit-output data/export/audit.jsonl`
+- `--validate-distribution`
 
 ## Run The First Rewrite Stage
 
@@ -118,18 +164,20 @@ Generate structured learner-friendly enrichment payloads from curated entries:
 uv run open-dictionary llm-enrich
 ```
 
-Useful flags:
-
-```bash
-uv run open-dictionary llm-enrich --limit-entries 50
-uv run open-dictionary llm-enrich --max-workers 4
-uv run open-dictionary llm-enrich --recompute-existing
-```
-
 This stage writes to:
 
 - `llm.prompt_versions`
 - `llm.entry_enrichments`
+
+Useful flags:
+
+```bash
+uv run open-dictionary llm-enrich --limit-entries 50
+uv run open-dictionary llm-enrich --env-file .env
+uv run open-dictionary llm-enrich --max-workers 50
+uv run open-dictionary llm-enrich --max-retries 3
+uv run open-dictionary llm-enrich --recompute-existing
+```
 
 ## Export Audit JSONL
 
@@ -157,6 +205,7 @@ Important:
 - it intentionally preserves the internal `curated` and `llm` stage split for
   debugging, replay, and auditability
 - the learner-facing export is a separate command and schema
+- `export-jsonl` is a deprecated alias for this command
 
 ## Export Distribution JSONL
 
@@ -182,6 +231,13 @@ This export:
 - keeps model, prompt, retries, and provenance in artifact metadata rather than
   leaking them into each distribution row
 
+Validate an existing distribution JSONL file:
+
+```bash
+uv run open-dictionary validate-distribution-jsonl \
+  --input data/export/distribution.jsonl
+```
+
 ## Optional Snapshot Utilities
 
 Download the compressed snapshot archive for local inspection:
@@ -198,6 +254,17 @@ uv run open-dictionary extract \
   --output data/raw-wiktextract-data.jsonl
 ```
 
-The rewrite pipeline itself should use `raw-ingest`, `curated-build`,
-`llm-enrich`, and then either `export-audit-jsonl` or
-`export-distribution-jsonl` rather than the legacy table-mutation workflow.
+## Command Reference
+
+The main commands are:
+
+- `db-init`
+- `download`
+- `extract`
+- `raw-ingest`
+- `curated-build`
+- `llm-enrich`
+- `export-audit-jsonl`
+- `export-distribution-jsonl`
+- `validate-distribution-jsonl`
+- `pipeline-run`
