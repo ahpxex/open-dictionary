@@ -18,7 +18,14 @@ class FixtureAwareFakeLLMClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def generate_json(self, *, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
+    def generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
         self.calls += 1
         marker = "Generated-field source payload:\n"
         payload = json.loads(user_prompt.split(marker, 1)[1])

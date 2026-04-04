@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -205,6 +206,130 @@ def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
         f"output_path={result.output_path} "
         f"output_sha256={result.output_sha256}"
     )
+    return 0
+
+
+def _cmd_pipeline_run(args: argparse.Namespace) -> int:
+    settings = _get_settings(args)
+    llm_env_file = args.llm_env_file or args.env_file
+
+    try:
+        if not args.skip_db_init:
+            with get_connection(settings) as conn:
+                apply_foundation(conn)
+
+        raw_result = run_raw_ingest_stage(
+            settings=settings,
+            workdir=args.workdir,
+            source_url=(
+                args.source_url or DEFAULT_WIKTIONARY_SOURCE_URL
+                if args.archive_path is None
+                else None
+            ),
+            archive_path=args.archive_path,
+            target_table=args.raw_table,
+            overwrite_download=args.overwrite_download,
+        )
+
+        curated_result = run_curated_build_stage(
+            settings=settings,
+            source_table=args.raw_table,
+            target_table=args.curated_table,
+            relations_table=args.relations_table,
+            triage_table=args.triage_table,
+            lang_codes=args.lang_codes,
+            limit_groups=args.limit_groups,
+            replace_existing=args.replace_existing_curated,
+        )
+
+        llm_result = run_llm_enrich_stage(
+            settings=settings,
+            env_file=llm_env_file,
+            source_table=args.curated_table,
+            target_table=args.llm_table,
+            prompt_version=args.prompt_version,
+            limit_entries=args.limit_entries,
+            max_workers=args.max_workers,
+            max_retries=args.max_retries,
+            recompute_existing=args.recompute_existing,
+        )
+        if llm_result.failed:
+            raise RuntimeError(
+                f"LLM enrichment left {llm_result.failed} failed entries. "
+                "Resolve them or rerun with a safer concurrency before distribution export."
+            )
+
+        distribution_result = None
+        if not args.skip_distribution_export:
+            distribution_result = run_export_distribution_jsonl_stage(
+                settings=settings,
+                output_path=args.distribution_output,
+                curated_table=args.curated_table,
+                llm_table=args.llm_table,
+                artifact_table=args.artifact_table,
+                model=args.model,
+                prompt_version=args.prompt_version,
+            )
+
+        audit_result = None
+        if args.audit_output is not None:
+            audit_result = run_export_audit_jsonl_stage(
+                settings=settings,
+                output_path=args.audit_output,
+                curated_table=args.curated_table,
+                llm_table=args.llm_table,
+                artifact_table=args.artifact_table,
+                model=args.model,
+                prompt_version=args.prompt_version,
+                include_unenriched=args.include_unenriched_audit,
+            )
+    except (psycopg.Error, ValueError, RuntimeError) as exc:
+        args._parser.error(str(exc))
+
+    summary = {
+        "db_initialized": not args.skip_db_init,
+        "raw": {
+            "run_id": str(raw_result.run_id),
+            "snapshot_id": str(raw_result.snapshot_id),
+            "rows_loaded": raw_result.rows_loaded,
+            "anomalies_logged": raw_result.anomalies_logged,
+        },
+        "curated": {
+            "run_id": str(curated_result.run_id),
+            "entries_written": curated_result.entries_written,
+            "relations_written": curated_result.relations_written,
+            "triage_written": curated_result.triage_written,
+        },
+        "llm": {
+            "run_id": str(llm_result.run_id),
+            "processed": llm_result.processed,
+            "succeeded": llm_result.succeeded,
+            "failed": llm_result.failed,
+            "prompt_version": args.prompt_version,
+            "max_workers": args.max_workers,
+        },
+        "distribution_export": (
+            {
+                "run_id": str(distribution_result.run_id),
+                "entry_count": distribution_result.entry_count,
+                "output_path": str(distribution_result.output_path),
+                "output_sha256": distribution_result.output_sha256,
+            }
+            if distribution_result is not None
+            else None
+        ),
+        "audit_export": (
+            {
+                "run_id": str(audit_result.run_id),
+                "entry_count": audit_result.entry_count,
+                "output_path": str(audit_result.output_path),
+                "output_sha256": audit_result.output_sha256,
+            }
+            if audit_result is not None
+            else None
+        ),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -564,6 +689,140 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_database_options(raw_ingest_parser)
     raw_ingest_parser.set_defaults(func=_cmd_raw_ingest, _parser=raw_ingest_parser)
+
+    pipeline_run_parser = subparsers.add_parser(
+        "pipeline-run",
+        help="Run the staged raw -> curated -> llm -> distribution pipeline from one command.",
+    )
+    pipeline_run_parser.add_argument(
+        "--skip-db-init",
+        action="store_true",
+        help="Assume the database foundation is already applied.",
+    )
+    pipeline_run_parser.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Working directory for snapshot acquisition and ingest (default: %(default)s).",
+    )
+    pipeline_source_group = pipeline_run_parser.add_mutually_exclusive_group()
+    pipeline_source_group.add_argument(
+        "--source-url",
+        help="Source URL for the Wiktionary snapshot (default: official raw dataset).",
+    )
+    pipeline_source_group.add_argument(
+        "--archive-path",
+        type=Path,
+        help="Use an existing local .jsonl or .jsonl.gz archive instead of downloading.",
+    )
+    pipeline_run_parser.add_argument(
+        "--raw-table",
+        default=DEFAULT_RAW_TABLE,
+        help="Destination raw table for imported entries (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--overwrite-download",
+        action="store_true",
+        help="Force re-download or overwrite an acquired archive in workdir.",
+    )
+    pipeline_run_parser.add_argument(
+        "--curated-table",
+        default=DEFAULT_CURATED_TABLE,
+        help="Target curated entries table (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--relations-table",
+        default="curated.entry_relations",
+        help="Target table for normalized curated relations (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--triage-table",
+        default="curated.triage_queue",
+        help="Target table for curated triage rows (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--lang-codes",
+        nargs="+",
+        help="Optional subset of language codes to process.",
+    )
+    pipeline_run_parser.add_argument(
+        "--limit-groups",
+        type=int,
+        help="Optional limit on grouped headwords during curated build.",
+    )
+    pipeline_run_parser.add_argument(
+        "--replace-existing-curated",
+        action="store_true",
+        help="Clear curated output tables before rebuilding them.",
+    )
+    pipeline_run_parser.add_argument(
+        "--llm-table",
+        default="llm.entry_enrichments",
+        help="Target LLM enrichment table (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--prompt-version",
+        default=PROMPT_VERSION,
+        help="Prompt version identifier used for LLM enrichment and export (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--llm-env-file",
+        help="Optional env file for LLM credentials. Defaults to --env-file.",
+    )
+    pipeline_run_parser.add_argument(
+        "--limit-entries",
+        type=int,
+        help="Optional limit on LLM-processed entries.",
+    )
+    pipeline_run_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Number of concurrent LLM worker threads (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Maximum retries per entry during LLM enrichment (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--recompute-existing",
+        action="store_true",
+        help="Re-enrich entries even if successful enrichments already exist.",
+    )
+    pipeline_run_parser.add_argument(
+        "--artifact-table",
+        default="export.artifacts",
+        help="Export artifact metadata table (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--model",
+        help="Optional model filter for the export stages.",
+    )
+    pipeline_run_parser.add_argument(
+        "--skip-distribution-export",
+        action="store_true",
+        help="Run through LLM enrichment but skip the learner-facing distribution export.",
+    )
+    pipeline_run_parser.add_argument(
+        "--distribution-output",
+        type=Path,
+        default=Path("data/export/distribution.jsonl"),
+        help="Output path for the learner-facing distribution export (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--audit-output",
+        type=Path,
+        help="Optional output path for the merged audit artifact. Omit to skip audit export.",
+    )
+    pipeline_run_parser.add_argument(
+        "--include-unenriched-audit",
+        action="store_true",
+        help="When writing the optional audit artifact, include entries without successful enrichments.",
+    )
+    _add_database_options(pipeline_run_parser)
+    pipeline_run_parser.set_defaults(func=_cmd_pipeline_run, _parser=pipeline_run_parser)
 
     return parser
 

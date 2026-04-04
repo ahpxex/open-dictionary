@@ -32,6 +32,34 @@ uv run open-dictionary db-init
 
 This creates the initial `meta`, `raw`, `curated`, `llm`, and `export` schemas.
 
+## Run The Full Pipeline
+
+Run the staged pipeline from one CLI command:
+
+```bash
+uv run open-dictionary pipeline-run \
+  --archive-path fixtures/wiktionary/raw.jsonl \
+  --distribution-output data/export/distribution.jsonl
+```
+
+Useful flags:
+
+```bash
+uv run open-dictionary pipeline-run \
+  --archive-path fixtures/wiktionary/raw.jsonl \
+  --llm-env-file .env \
+  --max-workers 50 \
+  --audit-output data/export/audit.jsonl
+```
+
+This command still runs the explicit stage contracts in order:
+
+- `raw-ingest`
+- `curated-build`
+- `llm-enrich`
+- `export-distribution-jsonl`
+- optional `export-audit-jsonl`
+
 ## Run The First Rewrite Stage
 
 Ingest a Wiktionary snapshot into the tracked raw tables:
