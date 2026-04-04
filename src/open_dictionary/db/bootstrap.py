@@ -253,6 +253,35 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             """,
         ),
     ),
+    Migration(
+        version="20260403_curated_lineage_v2",
+        statements=(
+            """
+            ALTER TABLE curated.entries
+            ADD COLUMN IF NOT EXISTS run_id UUID REFERENCES meta.pipeline_runs(run_id)
+            """,
+            """
+            ALTER TABLE curated.entry_relations
+            ADD COLUMN IF NOT EXISTS run_id UUID REFERENCES meta.pipeline_runs(run_id)
+            """,
+            """
+            ALTER TABLE curated.triage_queue
+            ADD COLUMN IF NOT EXISTS run_id UUID REFERENCES meta.pipeline_runs(run_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS curated_entries_run_id_idx
+            ON curated.entries (run_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS curated_entry_relations_run_id_idx
+            ON curated.entry_relations (run_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS curated_triage_queue_run_id_idx
+            ON curated.triage_queue (run_id)
+            """,
+        ),
+    ),
 )
 
 

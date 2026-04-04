@@ -5,6 +5,8 @@ from typing import Any
 
 
 PROMPT_VERSION = "curated_v1_distribution_fields_v1"
+DEFAULT_MAX_TOKENS = 1600
+COMPACT_RETRY_MAX_TOKENS = 800
 DEFINITION_LANGUAGE = {
     "code": "zh-Hans",
     "name": "Chinese (Simplified)",
@@ -34,6 +36,7 @@ The JSON object must contain:
 - study_notes: array of short Chinese study notes
 - etymology_note: short Chinese note or null
 - pos_groups: array with exactly the same pos values as the input skeleton
+  - pos_group_id
   - pos
   - summary: non-empty Chinese summary for this part of speech
   - usage_notes: Chinese string or null
@@ -45,6 +48,7 @@ The JSON object must contain:
 
 Requirements:
 - do not invent or rename pos values
+- do not invent or rename pos_group_id values
 - do not invent or rename sense_id values
 - do not omit any pos group from the input
 - do not omit any sense_id from the input
@@ -59,7 +63,9 @@ Example input skeleton:
   "definition_language": {"code": "zh-Hans", "name": "Chinese (Simplified)"},
   "pos_groups": [
     {
+      "pos_group_id": "adjective|et1",
       "pos": "adjective",
+      "etymology_id": "et1",
       "meanings": [
         {
           "sense_id": "s1",
@@ -80,6 +86,7 @@ Example output:
   "etymology_note": null,
   "pos_groups": [
     {
+      "pos_group_id": "adjective|et1",
       "pos": "adjective",
       "summary": "作为形容词时，它既可以形容技术系统复杂精密，也可以形容人或品味显得成熟老练。",
       "usage_notes": "具体中文要根据搭配判断。",
@@ -97,9 +104,47 @@ Example output:
 """.strip()
 
 
+COMPACT_RETRY_SYSTEM_PROMPT = """
+You are generating compact learner-facing dictionary explanations in Simplified Chinese.
+Return exactly one complete JSON object and nothing else.
+
+Hard constraints:
+- keep every field short
+- headword_summary must be exactly one sentence
+- study_notes must be [] or a one-item string array, never null
+- pos_groups[].summary must be exactly one sentence
+- meanings[].learner_explanation must be exactly one sentence
+- use null instead of long commentary when uncertain
+- do not use quoted example phrases inside the generated strings
+- do not invent or rename pos_group_id, pos, or sense_id
+- output valid JSON only
+
+Required JSON keys:
+- headword_summary
+- study_notes
+- etymology_note
+- pos_groups
+
+Each pos_groups item must contain:
+- pos_group_id
+- pos
+- summary
+- usage_notes
+- meanings
+
+Each meanings item must contain:
+- sense_id
+- short_gloss
+- learner_explanation
+- usage_note
+""".strip()
+
+
 def build_generation_source_payload(entry_payload: dict[str, Any]) -> dict[str, Any]:
     pos_groups = []
     for group in entry_payload.get("pos_groups", []):
+        pos = group.get("pos")
+        etymology_id = group.get("etymology_id")
         senses = []
         for sense in group.get("senses", []):
             senses.append(
@@ -123,8 +168,9 @@ def build_generation_source_payload(entry_payload: dict[str, Any]) -> dict[str, 
             )
         pos_groups.append(
             {
-                "pos": group.get("pos"),
-                "etymology_id": group.get("etymology_id"),
+                "pos_group_id": build_pos_group_id(pos=pos, etymology_id=etymology_id),
+                "pos": pos,
+                "etymology_id": etymology_id,
                 "meanings": senses,
             }
         )
@@ -156,3 +202,9 @@ def build_user_prompt(entry_payload: dict[str, Any]) -> str:
         "Generated-field source payload:\n"
         + json.dumps(entry_payload, ensure_ascii=False, indent=2, sort_keys=True)
     )
+
+
+def build_pos_group_id(*, pos: Any, etymology_id: Any) -> str:
+    pos_text = str(pos or "").strip() or "_"
+    etymology_text = str(etymology_id or "").strip() or "_"
+    return f"{pos_text}|{etymology_text}"

@@ -22,6 +22,11 @@ from .stages.curated_build import (
     DEFAULT_CURATED_TABLE,
     run_curated_build_stage,
 )
+from .stages.export_distribution_jsonl import (
+    DISTRIBUTION_SCHEMA_VERSION,
+    EXPORT_DISTRIBUTION_JSONL_STAGE,
+    run_export_distribution_jsonl_stage,
+)
 from .stages.export_jsonl import (
     EXPORT_AUDIT_JSONL_STAGE,
     run_export_audit_jsonl_stage,
@@ -167,6 +172,34 @@ def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
     print(
         "Audit JSONL export completed "
         f"stage={EXPORT_AUDIT_JSONL_STAGE} "
+        f"run_id={result.run_id} "
+        f"entry_count={result.entry_count} "
+        f"output_path={result.output_path} "
+        f"output_sha256={result.output_sha256}"
+    )
+    return 0
+
+
+def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
+    settings = _get_settings(args)
+
+    try:
+        result = run_export_distribution_jsonl_stage(
+            settings=settings,
+            output_path=args.output,
+            curated_table=args.curated_table,
+            llm_table=args.llm_table,
+            artifact_table=args.artifact_table,
+            model=args.model,
+            prompt_version=args.prompt_version,
+        )
+    except (psycopg.Error, ValueError, RuntimeError) as exc:
+        args._parser.error(str(exc))
+
+    print(
+        "Distribution JSONL export completed "
+        f"stage={EXPORT_DISTRIBUTION_JSONL_STAGE} "
+        f"schema_version={DISTRIBUTION_SCHEMA_VERSION} "
         f"run_id={result.run_id} "
         f"entry_count={result.entry_count} "
         f"output_path={result.output_path} "
@@ -412,6 +445,46 @@ def _build_parser() -> argparse.ArgumentParser:
     export_jsonl_alias_parser.set_defaults(
         func=_cmd_export_audit_jsonl,
         _parser=export_jsonl_alias_parser,
+    )
+
+    export_distribution_jsonl_parser = subparsers.add_parser(
+        "export-distribution-jsonl",
+        help="Export the learner-facing distribution JSONL artifact.",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/export/distribution.jsonl"),
+        help="Output JSONL path (default: %(default)s).",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--curated-table",
+        default="curated.entries",
+        help="Source curated entries table (default: %(default)s).",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--llm-table",
+        default="llm.entry_enrichments",
+        help="Source LLM enrichments table (default: %(default)s).",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--artifact-table",
+        default="export.artifacts",
+        help="Export artifact metadata table (default: %(default)s).",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--model",
+        help="Optional model filter when choosing the latest successful enrichment.",
+    )
+    export_distribution_jsonl_parser.add_argument(
+        "--prompt-version",
+        default=PROMPT_VERSION,
+        help="Prompt version required for distribution export (default: %(default)s).",
+    )
+    _add_database_options(export_distribution_jsonl_parser)
+    export_distribution_jsonl_parser.set_defaults(
+        func=_cmd_export_distribution_jsonl,
+        _parser=export_distribution_jsonl_parser,
     )
 
     download_parser = subparsers.add_parser(

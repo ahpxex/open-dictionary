@@ -107,16 +107,25 @@ def test_curated_build_stage_creates_entries_relations_and_triage(
         with conn.cursor() as cursor:
             cursor.execute("select count(*) from curated.entries")
             entries = cursor.fetchone()[0]
+            cursor.execute("select count(*) from curated.entries where run_id is not null")
+            entries_with_run_id = cursor.fetchone()[0]
             cursor.execute("select count(*) from curated.entry_relations")
             relations = cursor.fetchone()[0]
+            cursor.execute("select count(*) from curated.entry_relations where run_id is not null")
+            relations_with_run_id = cursor.fetchone()[0]
             cursor.execute("select count(*) from curated.triage_queue")
             triage = cursor.fetchone()[0]
+            cursor.execute("select count(*) from curated.triage_queue where run_id is not null")
+            triage_with_run_id = cursor.fetchone()[0]
 
     assert result.entries_written == entries
     assert result.relations_written == relations
     assert result.triage_written == triage
     assert entries >= 1
     assert triage >= 1
+    assert entries_with_run_id == entries
+    assert relations_with_run_id == relations
+    assert triage_with_run_id == triage
 
 
 def test_curated_build_stage_filters_by_lang_codes(

@@ -16,6 +16,9 @@ from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
 from open_dictionary.llm.config import load_llm_settings
 from open_dictionary.llm.prompt import (
+    COMPACT_RETRY_MAX_TOKENS,
+    COMPACT_RETRY_SYSTEM_PROMPT,
+    DEFAULT_MAX_TOKENS,
     OUTPUT_CONTRACT,
     PROMPT_VERSION,
     SYSTEM_PROMPT,
@@ -28,6 +31,7 @@ from .schema import build_expected_generation_targets, validate_enrichment_paylo
 
 
 LLM_ENRICH_STAGE = "llm.enrich"
+PERSIST_COMMIT_INTERVAL = 25
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,7 @@ def run_llm_enrich_stage(
             }
 
             with get_connection(settings) as conn:
+                pending_writes = 0
                 for future in concurrent.futures.as_completed(future_map):
                     processed += 1
                     try:
@@ -130,6 +135,13 @@ def run_llm_enrich_stage(
                             run_id=run_id,
                             record=record,
                         )
+                    pending_writes += 1
+                    if pending_writes >= PERSIST_COMMIT_INTERVAL:
+                        conn.commit()
+                        pending_writes = 0
+
+                if pending_writes:
+                    conn.commit()
 
                 complete_run(
                     conn,
@@ -227,16 +239,21 @@ def enrich_one_entry(
 ) -> dict[str, Any]:
     request_payload = entry["request_payload"]
     input_hash = entry["input_hash"]
-    expected_pos_targets = build_expected_generation_targets(entry["payload"])
-    user_prompt = build_user_prompt(request_payload["entry"])
+    generation_source_payload = request_payload["entry"]
+    expected_pos_targets = build_expected_generation_targets(generation_source_payload)
+    user_prompt = build_user_prompt(generation_source_payload)
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
+        use_compact_retry_prompt = attempt > 1
+        system_prompt = COMPACT_RETRY_SYSTEM_PROMPT if use_compact_retry_prompt else SYSTEM_PROMPT
+        max_tokens = COMPACT_RETRY_MAX_TOKENS if use_compact_retry_prompt else DEFAULT_MAX_TOKENS
         try:
             raw_response = llm_client.generate_json(
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.0,
+                max_tokens=max_tokens,
             )
             response_payload = json.loads(raw_response)
             validated = validate_enrichment_payload(
@@ -295,9 +312,6 @@ def persist_enrichment_success(conn, *, target_table: str, run_id: UUID, record:
                 record["retries"],
             ),
         )
-    conn.commit()
-
-
 def persist_enrichment_failure(
     conn,
     *,
@@ -340,9 +354,6 @@ def persist_enrichment_failure(
                 retries,
             ),
         )
-    conn.commit()
-
-
 def compute_input_hash(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

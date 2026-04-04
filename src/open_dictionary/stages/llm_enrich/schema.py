@@ -6,15 +6,17 @@ from typing import Any
 def build_expected_generation_targets(entry_payload: dict[str, Any]) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     for group in entry_payload.get("pos_groups", []):
+        pos_group_id = str(group.get("pos_group_id") or "").strip()
         pos = str(group.get("pos") or "").strip()
-        if not pos:
+        if not pos_group_id or not pos:
             continue
         sense_ids = []
-        for sense in group.get("senses", []):
+        meanings = group.get("meanings") or group.get("senses") or []
+        for sense in meanings:
             sense_id = str(sense.get("sense_id") or "").strip()
             if sense_id:
                 sense_ids.append(sense_id)
-        targets.append({"pos": pos, "sense_ids": sense_ids})
+        targets.append({"pos_group_id": pos_group_id, "pos": pos, "sense_ids": sense_ids})
     return targets
 
 
@@ -34,6 +36,8 @@ def validate_enrichment_payload(
     if not isinstance(payload["headword_summary"], str) or not payload["headword_summary"].strip():
         raise ValueError("LLM payload headword_summary must be a non-empty string")
 
+    if payload["study_notes"] is None:
+        payload["study_notes"] = []
     payload["study_notes"] = _normalize_string_list(payload["study_notes"], field_name="study_notes")
     payload["etymology_note"] = _normalize_optional_text(payload["etymology_note"], field_name="etymology_note")
 
@@ -41,41 +45,48 @@ def validate_enrichment_payload(
     if not isinstance(pos_groups, list):
         raise ValueError("LLM payload pos_groups must be an array")
 
-    expected_pos_index = {item["pos"].strip().casefold(): item for item in expected_pos_targets}
+    expected_pos_group_index = {item["pos_group_id"]: item for item in expected_pos_targets}
     normalized_pos_groups: dict[str, dict[str, Any]] = {}
 
     for item in pos_groups:
         if not isinstance(item, dict):
             raise ValueError("Each pos_groups item must be an object")
-        for field in ("pos", "summary", "usage_notes", "meanings"):
+        for field in ("pos_group_id", "pos", "summary", "usage_notes", "meanings"):
             if field not in item:
                 raise ValueError(f"pos_groups item is missing {field}")
 
+        pos_group_id = str(item["pos_group_id"] or "").strip()
         pos = str(item["pos"] or "").strip()
+        if not pos_group_id:
+            raise ValueError("pos_groups.pos_group_id must be a non-empty string")
         if not pos:
             raise ValueError("pos_groups.pos must be a non-empty string")
-        pos_key = pos.casefold()
-        if pos_key in normalized_pos_groups:
-            raise ValueError(f"LLM payload contains duplicate pos group: {pos}")
-        if pos_key not in expected_pos_index:
-            raise ValueError(f"LLM payload contains unexpected pos groups: {[pos]}")
+        if pos_group_id in normalized_pos_groups:
+            raise ValueError(f"LLM payload contains duplicate pos_group_id: {pos_group_id}")
+        expected_group = expected_pos_group_index.get(pos_group_id)
+        if expected_group is None:
+            raise ValueError(f"LLM payload contains unexpected pos_group_id: {pos_group_id}")
+        if pos.casefold() != expected_group["pos"].strip().casefold():
+            raise ValueError(
+                f"LLM payload pos mismatch for pos_group_id {pos_group_id}: expected {expected_group['pos']}, got {pos}"
+            )
 
         if not isinstance(item["summary"], str) or not item["summary"].strip():
             raise ValueError("pos_groups.summary must be a non-empty string")
         item["usage_notes"] = _normalize_optional_text(item["usage_notes"], field_name="pos_groups.usage_notes")
         item["meanings"] = _validate_meanings(
             item["meanings"],
-            expected_sense_ids=expected_pos_index[pos_key]["sense_ids"],
+            expected_sense_ids=expected_group["sense_ids"],
             pos=pos,
         )
-        normalized_pos_groups[pos_key] = item
+        normalized_pos_groups[pos_group_id] = item
 
-    missing_pos = [item["pos"] for item in expected_pos_targets if item["pos"].strip().casefold() not in normalized_pos_groups]
-    if missing_pos:
-        raise ValueError(f"LLM payload is missing pos groups: {missing_pos}")
+    missing_pos_group_ids = [item["pos_group_id"] for item in expected_pos_targets if item["pos_group_id"] not in normalized_pos_groups]
+    if missing_pos_group_ids:
+        raise ValueError(f"LLM payload is missing pos_group_ids: {missing_pos_group_ids}")
 
     payload["pos_groups"] = [
-        normalized_pos_groups[item["pos"].strip().casefold()]
+        normalized_pos_groups[item["pos_group_id"]]
         for item in expected_pos_targets
     ]
     return payload

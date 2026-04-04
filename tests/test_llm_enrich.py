@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import urllib.request
 from uuid import uuid4
 
 import pytest
@@ -9,8 +10,15 @@ import pytest
 from open_dictionary.config.settings import RuntimeSettings
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
+from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
+from open_dictionary.llm.config import LLMSettings
 from open_dictionary.llm.config import load_llm_settings
-from open_dictionary.llm.prompt import PROMPT_VERSION, build_generation_source_payload, build_user_prompt
+from open_dictionary.llm.prompt import (
+    PROMPT_VERSION,
+    build_generation_source_payload,
+    build_pos_group_id,
+    build_user_prompt,
+)
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.llm_enrich import stage as llm_stage
 from open_dictionary.stages.llm_enrich.schema import validate_enrichment_payload
@@ -20,16 +28,29 @@ class FakeLLMClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.max_tokens_seen: list[int | None] = []
 
-    def generate_json(self, *, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
+    def generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
         self.calls += 1
+        self.max_tokens_seen.append(max_tokens)
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
 
 
-def valid_payload(pos: str = "noun", sense_ids: list[str] | None = None) -> dict:
+def valid_payload(
+    pos: str = "noun",
+    sense_ids: list[str] | None = None,
+    etymology_id: str | None = None,
+) -> dict:
     sense_ids = ["s1"] if sense_ids is None else sense_ids
     return {
         "headword_summary": "一个对中文学习者友好的整体说明。",
@@ -37,6 +58,7 @@ def valid_payload(pos: str = "noun", sense_ids: list[str] | None = None) -> dict
         "etymology_note": "一个简短的词源说明。",
         "pos_groups": [
             {
+                "pos_group_id": build_pos_group_id(pos=pos, etymology_id=etymology_id),
                 "pos": pos,
                 "summary": "这个词性的整体说明。",
                 "usage_notes": "Usage note.",
@@ -56,6 +78,7 @@ def valid_payload(pos: str = "noun", sense_ids: list[str] | None = None) -> dict
 
 def seed_curated_entry(conn, *, word: str = "cat", lang_code: str = "en", pos: str = "noun") -> str:
     entry_id = str(uuid4())
+    run_id = start_run(conn, stage="curated.build")
     payload = {
         "entry_id": entry_id,
         "word": word,
@@ -98,10 +121,11 @@ def seed_curated_entry(conn, *, word: str = "cat", lang_code: str = "en", pos: s
         cursor.execute(
             """
             insert into curated.entries (
-                entry_id, lang_code, normalized_word, word, payload, entry_flags, source_summary
-            ) values (%s, %s, %s, %s, %s, %s, %s)
+                run_id, entry_id, lang_code, normalized_word, word, payload, entry_flags, source_summary
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                run_id,
                 entry_id,
                 lang_code,
                 word,
@@ -153,7 +177,10 @@ def test_validate_enrichment_payload_accepts_valid_shape() -> None:
     # This case locks in the baseline enrichment contract.
     payload = valid_payload("noun")
 
-    validated = validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+    validated = validate_enrichment_payload(
+        payload,
+        expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+    )
 
     assert validated["headword_summary"] == payload["headword_summary"]
 
@@ -161,7 +188,10 @@ def test_validate_enrichment_payload_accepts_valid_shape() -> None:
 def test_validate_enrichment_payload_rejects_missing_keys() -> None:
     # This case prevents silently accepting incomplete LLM output.
     with pytest.raises(ValueError, match="missing required keys"):
-        validate_enrichment_payload({"headword_summary": "x"}, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+        validate_enrichment_payload(
+            {"headword_summary": "x"},
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_rejects_empty_headword_summary() -> None:
@@ -170,7 +200,10 @@ def test_validate_enrichment_payload_rejects_empty_headword_summary() -> None:
     payload["headword_summary"] = "   "
 
     with pytest.raises(ValueError, match="headword_summary"):
-        validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+        validate_enrichment_payload(
+            payload,
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_rejects_invalid_study_notes() -> None:
@@ -179,15 +212,21 @@ def test_validate_enrichment_payload_rejects_invalid_study_notes() -> None:
     payload["study_notes"] = ["good", 123]
 
     with pytest.raises(ValueError, match="study_notes"):
-        validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+        validate_enrichment_payload(
+            payload,
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_rejects_unexpected_pos() -> None:
     # This case prevents the model from inventing part-of-speech groups that do not exist in curated data.
     payload = valid_payload("verb")
 
-    with pytest.raises(ValueError, match="unexpected pos groups"):
-        validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+    with pytest.raises(ValueError, match="unexpected pos_group_id"):
+        validate_enrichment_payload(
+            payload,
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_rejects_unexpected_sense_id() -> None:
@@ -195,7 +234,10 @@ def test_validate_enrichment_payload_rejects_unexpected_sense_id() -> None:
     payload = valid_payload("noun", sense_ids=["s2"])
 
     with pytest.raises(ValueError, match="unexpected sense_id"):
-        validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+        validate_enrichment_payload(
+            payload,
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_rejects_missing_sense_id() -> None:
@@ -203,7 +245,10 @@ def test_validate_enrichment_payload_rejects_missing_sense_id() -> None:
     payload = valid_payload("noun", sense_ids=[])
 
     with pytest.raises(ValueError, match="missing sense_ids"):
-        validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+        validate_enrichment_payload(
+            payload,
+            expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+        )
 
 
 def test_validate_enrichment_payload_coerces_string_study_notes() -> None:
@@ -211,9 +256,25 @@ def test_validate_enrichment_payload_coerces_string_study_notes() -> None:
     payload = valid_payload()
     payload["study_notes"] = "Single note"
 
-    validated = validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+    validated = validate_enrichment_payload(
+        payload,
+        expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+    )
 
     assert validated["study_notes"] == ["Single note"]
+
+
+def test_validate_enrichment_payload_coerces_null_study_notes_to_empty_list() -> None:
+    # This case handles compact fallback generations that choose null instead of [] for optional notes.
+    payload = valid_payload()
+    payload["study_notes"] = None
+
+    validated = validate_enrichment_payload(
+        payload,
+        expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+    )
+
+    assert validated["study_notes"] == []
 
 
 def test_validate_enrichment_payload_coerces_usage_note_lists() -> None:
@@ -222,7 +283,10 @@ def test_validate_enrichment_payload_coerces_usage_note_lists() -> None:
     payload["pos_groups"][0]["usage_notes"] = ["First note.", "Second note."]
     payload["pos_groups"][0]["meanings"][0]["usage_note"] = ["Meaning note one.", "Meaning note two."]
 
-    validated = validate_enrichment_payload(payload, expected_pos_targets=[{"pos": "noun", "sense_ids": ["s1"]}])
+    validated = validate_enrichment_payload(
+        payload,
+        expected_pos_targets=[{"pos_group_id": build_pos_group_id(pos="noun", etymology_id=None), "pos": "noun", "sense_ids": ["s1"]}],
+    )
 
     assert validated["pos_groups"][0]["usage_notes"] == "First note. Second note."
     assert validated["pos_groups"][0]["meanings"][0]["usage_note"] == "Meaning note one. Meaning note two."
@@ -241,10 +305,22 @@ def test_compute_input_hash_is_stable() -> None:
 def test_enrich_one_entry_succeeds_with_fake_client() -> None:
     # This case covers the happy-path single-entry enrichment flow.
     client = FakeLLMClient([json.dumps(valid_payload("noun"))])
+    request_entry = build_generation_source_payload(
+        {
+            "entry_id": "entry-1",
+            "word": "cat",
+            "normalized_word": "cat",
+            "lang": "English",
+            "lang_code": "en",
+            "entry_flags": [],
+            "etymology_groups": [],
+            "pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}],
+        }
+    )
     entry = {
         "entry_id": "entry-1",
-        "payload": {"pos_groups": [{"pos": "noun", "senses": [{"sense_id": "s1"}]}]},
-        "request_payload": {"entry": "payload"},
+        "payload": {"pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}]},
+        "request_payload": {"entry": request_entry},
         "input_hash": "hash",
     }
 
@@ -264,10 +340,22 @@ def test_enrich_one_entry_succeeds_with_fake_client() -> None:
 def test_enrich_one_entry_retries_before_success() -> None:
     # This case verifies that transient model failures are retried instead of immediately failing the stage.
     client = FakeLLMClient([ValueError("bad"), json.dumps(valid_payload("noun"))])
+    request_entry = build_generation_source_payload(
+        {
+            "entry_id": "entry-1",
+            "word": "cat",
+            "normalized_word": "cat",
+            "lang": "English",
+            "lang_code": "en",
+            "entry_flags": [],
+            "etymology_groups": [],
+            "pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}],
+        }
+    )
     entry = {
         "entry_id": "entry-1",
-        "payload": {"pos_groups": [{"pos": "noun", "senses": [{"sense_id": "s1"}]}]},
-        "request_payload": {"entry": "payload"},
+        "payload": {"pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}]},
+        "request_payload": {"entry": request_entry},
         "input_hash": "hash",
     }
 
@@ -281,15 +369,28 @@ def test_enrich_one_entry_retries_before_success() -> None:
 
     assert record["retries"] == 1
     assert client.calls == 2
+    assert client.max_tokens_seen == [llm_stage.DEFAULT_MAX_TOKENS, llm_stage.COMPACT_RETRY_MAX_TOKENS]
 
 
 def test_enrich_one_entry_raises_after_max_retries() -> None:
     # This case ensures persistent invalid outputs bubble up as failures.
     client = FakeLLMClient([ValueError("bad"), ValueError("still bad")])
+    request_entry = build_generation_source_payload(
+        {
+            "entry_id": "entry-1",
+            "word": "cat",
+            "normalized_word": "cat",
+            "lang": "English",
+            "lang_code": "en",
+            "entry_flags": [],
+            "etymology_groups": [],
+            "pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}],
+        }
+    )
     entry = {
         "entry_id": "entry-1",
-        "payload": {"pos_groups": [{"pos": "noun", "senses": [{"sense_id": "s1"}]}]},
-        "request_payload": {"entry": "payload"},
+        "payload": {"pos_groups": [{"pos": "noun", "etymology_id": None, "senses": [{"sense_id": "s1"}]}]},
+        "request_payload": {"entry": request_entry},
         "input_hash": "hash",
     }
 
@@ -301,6 +402,25 @@ def test_enrich_one_entry_raises_after_max_retries() -> None:
             model="test-model",
             max_retries=2,
         )
+
+
+def test_openai_client_wraps_timeout_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This case ensures transport-level timeouts enter the stage retry path instead of escaping as raw exceptions.
+    client = OpenAICompatLLMClient(
+        LLMSettings(
+            api_base="http://127.0.0.1:3888/v1",
+            api_key="EMPTY",
+            model="test-model",
+        )
+    )
+
+    def raise_timeout(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_timeout)
+
+    with pytest.raises(LLMClientError, match="timed out"):
+        client.generate_json(system_prompt="system", user_prompt="user", max_tokens=100)
 
 
 def test_ensure_prompt_version_is_idempotent(temp_database_url: str) -> None:

@@ -128,8 +128,31 @@ Important:
 - this audit artifact is not the final learner-facing distribution contract
 - it intentionally preserves the internal `curated` and `llm` stage split for
   debugging, replay, and auditability
-- the future final distribution JSONL must flatten those stage payloads into a
-  product-facing schema
+- the learner-facing export is a separate command and schema
+
+## Export Distribution JSONL
+
+Export the learner-facing final JSONL artifact:
+
+```bash
+uv run open-dictionary export-distribution-jsonl --output data/export/distribution.jsonl
+```
+
+Useful flags:
+
+```bash
+uv run open-dictionary export-distribution-jsonl --model Qwen/Qwen3.5-122B-A10B-FP8
+uv run open-dictionary export-distribution-jsonl --prompt-version curated_v1_distribution_fields_v1
+```
+
+This export:
+
+- requires successful LLM enrichments with the distribution-field prompt contract
+- flattens curated structure and generated explanatory fields into
+  `distribution_entry_v1`
+- skips entries that do not contain any distributable meanings after merge
+- keeps model, prompt, retries, and provenance in artifact metadata rather than
+  leaking them into each distribution row
 
 ## Optional Snapshot Utilities
 
@@ -148,5 +171,5 @@ uv run open-dictionary extract \
 ```
 
 The rewrite pipeline itself should use `raw-ingest`, `curated-build`,
-`llm-enrich`, and `export-audit-jsonl` rather than the legacy table-mutation
-workflow.
+`llm-enrich`, and then either `export-audit-jsonl` or
+`export-distribution-jsonl` rather than the legacy table-mutation workflow.

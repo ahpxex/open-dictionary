@@ -57,20 +57,26 @@ def run_export_jsonl_stage(
         )
 
     try:
-        documents = list(iter_export_documents(
-            settings=settings,
-            curated_table=curated_table,
-            llm_table=llm_table,
-            model=model,
-            prompt_version=prompt_version,
-            include_unenriched=include_unenriched,
-        ))
+        records = list(
+            iter_export_records(
+                settings=settings,
+                curated_table=curated_table,
+                llm_table=llm_table,
+                model=model,
+                prompt_version=prompt_version,
+                include_unenriched=include_unenriched,
+            )
+        )
+        documents = [record["document"] for record in records]
+        curated_run_ids = sorted({record["curated_run_id"] for record in records if record["curated_run_id"]})
+        llm_run_ids = sorted({record["llm_run_id"] for record in records if record["llm_run_id"]})
         output_sha256 = write_jsonl_atomic(output_path, documents)
         with get_connection(settings) as conn:
             record_export_artifact(
                 conn,
                 artifact_table=artifact_table,
                 run_id=run_id,
+                artifact_type="audit_jsonl",
                 output_path=output_path,
                 output_sha256=output_sha256,
                 entry_count=len(documents),
@@ -81,6 +87,8 @@ def run_export_jsonl_stage(
                     "prompt_version": prompt_version,
                     "include_unenriched": include_unenriched,
                     "artifact_role": "audit",
+                    "curated_run_ids": curated_run_ids,
+                    "llm_run_ids": llm_run_ids,
                 },
             )
             complete_run(
@@ -90,6 +98,8 @@ def run_export_jsonl_stage(
                     "output_path": str(output_path),
                     "entry_count": len(documents),
                     "output_sha256": output_sha256,
+                    "curated_run_ids": curated_run_ids,
+                    "llm_run_ids": llm_run_ids,
                 },
             )
         return ExportJSONLResult(
@@ -104,7 +114,7 @@ def run_export_jsonl_stage(
         raise
 
 
-def iter_export_documents(
+def iter_export_records(
     *,
     settings: RuntimeSettings,
     curated_table: str,
@@ -119,6 +129,7 @@ def iter_export_documents(
     latest_enrichment_sql = sql.SQL(
         """
         SELECT DISTINCT ON (entry_id)
+            run_id,
             entry_id,
             model,
             prompt_version,
@@ -144,11 +155,13 @@ def iter_export_documents(
             {latest_enrichment_sql}
         )
         SELECT
+            e.run_id,
             e.entry_id,
             e.lang_code,
             e.normalized_word,
             e.word,
             e.payload,
+            l.run_id,
             l.model,
             l.prompt_version,
             l.response_payload
@@ -166,23 +179,47 @@ def iter_export_documents(
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(query, params)
-            for entry_id, lang_code, normalized_word, word, payload, enrich_model, enrich_prompt_version, response_payload in cursor.fetchall():
+            for curated_run_id, entry_id, lang_code, normalized_word, word, payload, llm_run_id, enrich_model, enrich_prompt_version, response_payload in cursor.fetchall():
                 yield {
-                    "entry_id": str(entry_id),
-                    "lang_code": lang_code,
-                    "normalized_word": normalized_word,
-                    "word": word,
-                    "curated": payload,
-                    "llm": (
-                        {
-                            "model": enrich_model,
-                            "prompt_version": enrich_prompt_version,
-                            "payload": response_payload,
-                        }
-                        if response_payload is not None
-                        else None
-                    ),
+                    "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
+                    "llm_run_id": str(llm_run_id) if llm_run_id is not None else None,
+                    "document": {
+                        "entry_id": str(entry_id),
+                        "lang_code": lang_code,
+                        "normalized_word": normalized_word,
+                        "word": word,
+                        "curated": payload,
+                        "llm": (
+                            {
+                                "model": enrich_model,
+                                "prompt_version": enrich_prompt_version,
+                                "payload": response_payload,
+                            }
+                            if response_payload is not None
+                            else None
+                        ),
+                    },
                 }
+
+
+def iter_export_documents(
+    *,
+    settings: RuntimeSettings,
+    curated_table: str,
+    llm_table: str,
+    model: str | None,
+    prompt_version: str | None,
+    include_unenriched: bool,
+):
+    for record in iter_export_records(
+        settings=settings,
+        curated_table=curated_table,
+        llm_table=llm_table,
+        model=model,
+        prompt_version=prompt_version,
+        include_unenriched=include_unenriched,
+    ):
+        yield record["document"]
 
 
 def write_jsonl_atomic(output_path: Path, documents: list[dict[str, Any]]) -> str:
@@ -208,6 +245,7 @@ def record_export_artifact(
     *,
     artifact_table: str,
     run_id: UUID,
+    artifact_type: str,
     output_path: Path,
     output_sha256: str,
     entry_count: int,
@@ -230,7 +268,7 @@ def record_export_artifact(
             ).format(artifact_identifier),
             (
                 run_id,
-                "audit_jsonl",
+                artifact_type,
                 str(output_path),
                 output_sha256,
                 entry_count,

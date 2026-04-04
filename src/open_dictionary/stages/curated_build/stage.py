@@ -81,6 +81,7 @@ def run_curated_build_stage(
                     output = build_curated_entry(current_rows)
                     entries_written += persist_curated_output(
                         conn,
+                        run_id=run_id,
                         output=output,
                         target_table=target_table,
                         relations_table=relations_table,
@@ -102,6 +103,7 @@ def run_curated_build_stage(
                 output = build_curated_entry(current_rows)
                 entries_written += persist_curated_output(
                     conn,
+                    run_id=run_id,
                     output=output,
                     target_table=target_table,
                     relations_table=relations_table,
@@ -170,25 +172,33 @@ def iter_groupable_rows(conn, *, source_table: str, lang_codes: list[str] | None
 def persist_curated_output(
     conn,
     *,
+    run_id: UUID,
     output: CuratedBuildOutput,
     target_table: str,
     relations_table: str,
     triage_table: str,
 ) -> int:
     if output.entry is not None:
-        upsert_entry(conn, target_table=target_table, entry=output.entry)
-        replace_relations(conn, relations_table=relations_table, entry_id=output.entry["entry_id"], relations=output.relations)
+        upsert_entry(conn, target_table=target_table, run_id=run_id, entry=output.entry)
+        replace_relations(
+            conn,
+            relations_table=relations_table,
+            run_id=run_id,
+            entry_id=output.entry["entry_id"],
+            relations=output.relations,
+        )
     for triage_item in output.triage_items:
-        insert_triage_item(conn, triage_table=triage_table, item=triage_item)
+        insert_triage_item(conn, triage_table=triage_table, run_id=run_id, item=triage_item)
     conn.commit()
     return 1 if output.entry is not None else 0
 
 
-def upsert_entry(conn, *, target_table: str, entry: dict[str, Any]) -> None:
+def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]) -> None:
     table_identifier = _identifier_from_dotted(target_table)
     query = sql.SQL(
         """
         INSERT INTO {} (
+            run_id,
             entry_id,
             lang_code,
             normalized_word,
@@ -196,9 +206,10 @@ def upsert_entry(conn, *, target_table: str, entry: dict[str, Any]) -> None:
             payload,
             entry_flags,
             source_summary
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (entry_id)
         DO UPDATE SET
+            run_id = EXCLUDED.run_id,
             lang_code = EXCLUDED.lang_code,
             normalized_word = EXCLUDED.normalized_word,
             word = EXCLUDED.word,
@@ -213,6 +224,7 @@ def upsert_entry(conn, *, target_table: str, entry: dict[str, Any]) -> None:
         cursor.execute(
             query,
             (
+                run_id,
                 entry["entry_id"],
                 entry["lang_code"],
                 entry["normalized_word"],
@@ -224,19 +236,27 @@ def upsert_entry(conn, *, target_table: str, entry: dict[str, Any]) -> None:
         )
 
 
-def replace_relations(conn, *, relations_table: str, entry_id: str, relations: list[dict[str, Any]]) -> None:
+def replace_relations(
+    conn,
+    *,
+    relations_table: str,
+    run_id: UUID,
+    entry_id: str,
+    relations: list[dict[str, Any]],
+) -> None:
     table_identifier = _identifier_from_dotted(relations_table)
     with conn.cursor() as cursor:
         cursor.execute(sql.SQL("DELETE FROM {} WHERE entry_id = %s").format(table_identifier), (entry_id,))
         if not relations:
             return
         values_sql = sql.SQL(", ").join(
-            sql.SQL("(%s::uuid, %s::text, %s::text, %s::text, %s::text, %s::jsonb)")
+            sql.SQL("(%s::uuid, %s::uuid, %s::text, %s::text, %s::text, %s::text, %s::jsonb)")
             for _ in relations
         )
         query = sql.SQL(
             """
             INSERT INTO {} (
+                run_id,
                 entry_id,
                 relation_type,
                 target_word,
@@ -250,6 +270,7 @@ def replace_relations(conn, *, relations_table: str, entry_id: str, relations: l
         for relation in relations:
             params.extend(
                 (
+                    run_id,
                     entry_id,
                     relation["relation_type"],
                     relation["target_word"],
@@ -261,11 +282,12 @@ def replace_relations(conn, *, relations_table: str, entry_id: str, relations: l
         cursor.execute(query, params)
 
 
-def insert_triage_item(conn, *, triage_table: str, item: TriageItem) -> None:
+def insert_triage_item(conn, *, triage_table: str, run_id: UUID, item: TriageItem) -> None:
     table_identifier = _identifier_from_dotted(triage_table)
     query = sql.SQL(
         """
         INSERT INTO {} (
+            run_id,
             lang_code,
             word,
             reason_code,
@@ -273,13 +295,14 @@ def insert_triage_item(conn, *, triage_table: str, item: TriageItem) -> None:
             suggested_action,
             raw_record_refs,
             payload
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
     ).format(table_identifier)
     with conn.cursor() as cursor:
         cursor.execute(
             query,
             (
+                run_id,
                 item.lang_code,
                 item.word,
                 item.reason_code,

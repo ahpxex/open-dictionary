@@ -21,6 +21,7 @@ def seed_curated_entry(
     lang_code: str = "en",
 ) -> str:
     entry_id = str(uuid4())
+    run_id = start_run(conn, stage="curated.build")
     payload = {
         "entry_id": entry_id,
         "word": word,
@@ -41,10 +42,10 @@ def seed_curated_entry(
         cursor.execute(
             """
             insert into curated.entries (
-                entry_id, lang_code, normalized_word, word, payload, entry_flags, source_summary
-            ) values (%s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
+                run_id, entry_id, lang_code, normalized_word, word, payload, entry_flags, source_summary
+            ) values (%s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
             """,
-            (entry_id, lang_code, word.casefold(), word, json.dumps(payload), [], json.dumps(payload["source_summary"])),
+            (run_id, entry_id, lang_code, word.casefold(), word, json.dumps(payload), [], json.dumps(payload["source_summary"])),
         )
     return entry_id
 
@@ -313,6 +314,7 @@ def test_record_export_artifact_persists_metadata(temp_database_url: str, tmp_pa
             conn,
             artifact_table="export.artifacts",
             run_id=run_id,
+            artifact_type="audit_jsonl",
             output_path=tmp_path / "out.jsonl",
             output_sha256="sha",
             entry_count=3,
@@ -339,9 +341,19 @@ def test_run_export_jsonl_stage_writes_output_and_manifest(temp_database_url: st
 
     result = export_stage.run_export_jsonl_stage(settings=settings, output_path=output)
 
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "select metadata->'curated_run_ids', metadata->'llm_run_ids' from export.artifacts where run_id = %s",
+                (result.run_id,),
+            )
+            curated_run_ids, llm_run_ids = cursor.fetchone()
+
     assert result.entry_count == 1
     assert output.exists()
     assert read_jsonl(output)[0]["word"] == "cat"
+    assert curated_run_ids
+    assert llm_run_ids
 
 
 def test_run_export_jsonl_stage_can_emit_only_enriched_entries(temp_database_url: str, tmp_path: Path) -> None:
@@ -529,6 +541,7 @@ def test_record_export_artifact_tracks_entry_count(temp_database_url: str, tmp_p
             conn,
             artifact_table="export.artifacts",
             run_id=run_id,
+            artifact_type="audit_jsonl",
             output_path=tmp_path / "out.jsonl",
             output_sha256="sha",
             entry_count=7,

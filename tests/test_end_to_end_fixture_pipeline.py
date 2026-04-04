@@ -6,7 +6,9 @@ from pathlib import Path
 from open_dictionary.config.settings import RuntimeSettings
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
+from open_dictionary.stages.export_distribution_jsonl.schema import validate_distribution_document
 from open_dictionary.stages.curated_build.stage import run_curated_build_stage
+from open_dictionary.stages.export_distribution_jsonl.stage import run_export_distribution_jsonl_stage
 from open_dictionary.stages.export_jsonl.stage import run_export_jsonl_stage
 from open_dictionary.stages.llm_enrich.stage import run_llm_enrich_stage
 from open_dictionary.stages.raw_ingest.stage import run_raw_ingest_stage
@@ -24,6 +26,7 @@ class FixtureAwareFakeLLMClient:
         for group in payload.get("pos_groups", []):
             pos_groups.append(
                 {
+                    "pos_group_id": group["pos_group_id"],
                     "pos": group["pos"],
                     "summary": f"{group['pos']} 的整体说明。",
                     "usage_notes": None,
@@ -133,3 +136,94 @@ def test_fixture_pipeline_export_rows_contain_curated_and_llm_sections(
     assert "llm" in first_doc
     assert "pos_groups" in first_doc["curated"]
     assert "headword_summary" in first_doc["llm"]["payload"]
+
+
+def test_fixture_pipeline_distribution_export_rows_have_learner_facing_shape(
+    tmp_path: Path,
+    temp_database_url: str,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LLM_API=http://localhost:3888/v1\nLLM_KEY=EMPTY\nLLM_MODEL=test-model\n",
+        encoding="utf-8",
+    )
+    settings = RuntimeSettings(database_url=temp_database_url)
+    fixture_path = Path("fixtures/wiktionary/raw.jsonl")
+    output_path = tmp_path / "distribution.jsonl"
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+
+    run_raw_ingest_stage(
+        settings=settings,
+        workdir=tmp_path / "raw-workdir",
+        archive_path=fixture_path,
+    )
+    run_curated_build_stage(settings=settings, limit_groups=25)
+    run_llm_enrich_stage(
+        settings=settings,
+        env_file=str(env_file),
+        client=FixtureAwareFakeLLMClient(),
+        max_workers=2,
+    )
+    run_export_distribution_jsonl_stage(
+        settings=settings,
+        output_path=output_path,
+    )
+
+    first_doc = json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert first_doc["schema_version"] == "distribution_entry_v1"
+    assert "curated" not in first_doc
+    assert "llm" not in first_doc
+    assert "headword_summary" in first_doc
+    assert "definition_language" in first_doc
+    assert "learner_explanation" in first_doc["pos_groups"][0]["meanings"][0]
+
+
+def test_fixture_pipeline_distribution_export_validates_all_rows_on_full_fixture(
+    tmp_path: Path,
+    temp_database_url: str,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LLM_API=http://localhost:3888/v1\nLLM_KEY=EMPTY\nLLM_MODEL=test-model\n",
+        encoding="utf-8",
+    )
+    settings = RuntimeSettings(database_url=temp_database_url)
+    fixture_path = Path("fixtures/wiktionary/raw.jsonl")
+    output_path = tmp_path / "distribution-full.jsonl"
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+
+    raw_result = run_raw_ingest_stage(
+        settings=settings,
+        workdir=tmp_path / "raw-workdir",
+        archive_path=fixture_path,
+    )
+    curated_result = run_curated_build_stage(settings=settings)
+    llm_result = run_llm_enrich_stage(
+        settings=settings,
+        env_file=str(env_file),
+        client=FixtureAwareFakeLLMClient(),
+        max_workers=4,
+    )
+    export_result = run_export_distribution_jsonl_stage(
+        settings=settings,
+        output_path=output_path,
+    )
+
+    documents = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert raw_result.rows_loaded == 1000
+    assert curated_result.entries_written == 742
+    assert llm_result.succeeded == 742
+    assert 0 < export_result.entry_count <= 742
+    assert len(documents) == export_result.entry_count
+    for document in documents:
+        validate_distribution_document(document)

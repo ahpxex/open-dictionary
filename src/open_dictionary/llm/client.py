@@ -15,7 +15,14 @@ class OpenAICompatLLMClient:
     def __init__(self, settings: LLMSettings):
         self._settings = settings
 
-    def generate_json(self, *, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
+    def generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
         body = {
             "model": self._settings.model,
             "messages": [
@@ -25,6 +32,8 @@ class OpenAICompatLLMClient:
             "temperature": temperature,
             "response_format": {"type": "json_object"},
         }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         payload = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             self._settings.api_base.rstrip("/") + "/chat/completions",
@@ -38,7 +47,7 @@ class OpenAICompatLLMClient:
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
                 data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError) as exc:
             raise LLMClientError(f"LLM request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise LLMClientError(f"LLM response was not valid JSON: {exc}") from exc

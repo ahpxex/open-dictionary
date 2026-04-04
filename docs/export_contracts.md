@@ -2,12 +2,16 @@
 
 ## Status
 
-Open Dictionary currently has one implemented JSONL export:
+Open Dictionary currently has two implemented JSONL exports:
 
 - `audit_jsonl`
+- `distribution_jsonl`
 
-This is an internal audit artifact.
-It is **not** the final learner-facing distribution format.
+The audit artifact is internal.
+The distribution artifact is the learner-facing final format.
+
+Both artifact types record upstream run lineage in `export.artifacts.metadata`,
+including `curated_run_ids` and `llm_run_ids`.
 
 The project must keep these two export classes distinct:
 
@@ -35,11 +39,11 @@ Non-goals:
 - this format is not meant to be stable for end-user products
 - this format must not be treated as the final dictionary contract
 
-## Target Distribution Contract
+## Distribution JSONL
 
-The target final JSONL contract is `distribution_entry_v1`.
+The implemented final JSONL contract is `distribution_entry_v1`.
 
-Each row must represent one learner-facing dictionary entry and must not expose
+Each row represents one learner-facing dictionary entry and does not expose
 internal pipeline-stage wrappers such as `curated` and `llm`.
 
 ### Required top-level structure
@@ -67,6 +71,18 @@ internal pipeline-stage wrappers such as `curated` and `llm`.
 }
 ```
 
+### Pos-group identity rule
+
+Distribution export uses a stable `pos_group_id`, derived from `(pos,
+etymology_id)`, to prevent same-POS groups from being merged incorrectly when a
+headword has multiple etymologies.
+
+Each distribution `pos_group` row therefore contains:
+
+- `pos_group_id`
+- `pos`
+- `etymology_id`
+
 ### Meaning-level rule
 
 The final contract must not collapse meaning content back into short traditional
@@ -82,15 +98,24 @@ Every meaning row should have:
 The learner explanation is the product field.
 The short gloss is only a helper field.
 
+Rows with no distributable meanings are excluded from `distribution_jsonl`
+entirely. The export metadata records the number of skipped entries under
+`skipped_entries_without_meanings`.
+
 ### Language rule
 
-The final contract must explicitly separate:
+The final contract explicitly separates:
 
 - `headword_language`
 - `definition_language`
 
 This avoids conflating source-language identity with explanation-language
 identity.
+
+## Historical Note
+
+Earlier merged `curated + llm` JSONL rows are still exported as `audit_jsonl`
+for debugging and replay. They are not the final product contract.
 
 ## What Must Stay Out Of Distribution Rows
 
@@ -135,7 +160,7 @@ The LLM input should include stable identifiers from curated data, such as:
 
 - `entry_id`
 - `etymology_id`
-- `pos`
+- `pos_group_id`
 - `sense_id`
 
 The model output must attach explanatory content back to those IDs instead of
@@ -168,7 +193,7 @@ It must also verify alignment with the curated source row.
 
 Examples:
 
-- no extra `pos` groups beyond curated input
+- no extra `pos_group_id` values beyond curated input
 - no missing required sense IDs
 - no unknown sense IDs
 - no extra etymology IDs
@@ -195,7 +220,7 @@ They do not belong in final dictionary rows.
 
 ### 7. Test the contract explicitly
 
-Tests for the future distribution export must assert:
+Tests for the implemented distribution export assert:
 
 - no `curated` key
 - no `llm` key
