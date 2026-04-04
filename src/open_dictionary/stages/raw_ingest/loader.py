@@ -6,6 +6,7 @@ from uuid import UUID
 
 from psycopg import sql
 
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress
 from open_dictionary.sources.wiktionary import SnapshotArtifact, SourceAnomaly, SourceRecord
 from open_dictionary.sources.wiktionary.project import project_raw_record
 from open_dictionary.sources.wiktionary.stream import iter_source_items
@@ -32,7 +33,9 @@ def load_snapshot(
     target_table: str,
     stage_name: str,
     chunk_size: int = 5000,
+    progress_callback: ProgressCallback | None = None,
 ) -> LoadStats:
+    reporter = ThrottledProgressReporter(progress_callback, stage=stage_name)
     if _snapshot_is_preexisting(
         conn,
         snapshot_id=snapshot_id,
@@ -51,6 +54,14 @@ def load_snapshot(
                 "last_source_byte_offset": stats.last_source_byte_offset,
                 "snapshot_preexisting": True,
             },
+        )
+        emit_progress(
+            progress_callback,
+            stage=stage_name,
+            event="snapshot_preexisting",
+            rows_loaded=stats.rows_loaded,
+            anomalies_logged=stats.anomalies_logged,
+            snapshot_preexisting=True,
         )
         conn.commit()
         return stats
@@ -105,6 +116,13 @@ def load_snapshot(
                 },
             )
             conn.commit()
+            reporter.report(
+                event="load_progress",
+                rows_loaded=rows_loaded,
+                anomalies_logged=anomalies_logged,
+                last_source_line=last_source_line,
+                last_source_byte_offset=last_source_byte_offset,
+            )
 
     if row_chunk:
         rows_loaded += flush_rows(
@@ -135,6 +153,15 @@ def load_snapshot(
         },
     )
     conn.commit()
+    reporter.report(
+        event="load_complete",
+        force=True,
+        rows_loaded=rows_loaded,
+        anomalies_logged=anomalies_logged,
+        last_source_line=last_source_line,
+        last_source_byte_offset=last_source_byte_offset,
+        snapshot_preexisting=False,
+    )
 
     return LoadStats(
         rows_loaded=rows_loaded,

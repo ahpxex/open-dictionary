@@ -12,7 +12,7 @@ from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
-from open_dictionary.pipeline import complete_run, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
 
 
 EXPORT_AUDIT_JSONL_STAGE = "export.audit_jsonl"
@@ -39,6 +39,7 @@ def run_export_jsonl_stage(
     model: str | None = None,
     prompt_version: str | None = None,
     include_unenriched: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
     with get_connection(settings) as conn:
         run_id = start_run(
@@ -57,6 +58,14 @@ def run_export_jsonl_stage(
         )
 
     try:
+        emit_progress(
+            progress_callback,
+            stage=EXPORT_AUDIT_JSONL_STAGE,
+            event="export_start",
+            include_unenriched=include_unenriched,
+            model=model,
+            prompt_version=prompt_version,
+        )
         records = list(
             iter_export_records(
                 settings=settings,
@@ -65,12 +74,21 @@ def run_export_jsonl_stage(
                 model=model,
                 prompt_version=prompt_version,
                 include_unenriched=include_unenriched,
+                progress_callback=progress_callback,
             )
         )
         documents = [record["document"] for record in records]
         curated_run_ids = sorted({record["curated_run_id"] for record in records if record["curated_run_id"]})
         llm_run_ids = sorted({record["llm_run_id"] for record in records if record["llm_run_id"]})
         output_sha256 = write_jsonl_atomic(output_path, documents)
+        emit_progress(
+            progress_callback,
+            stage=EXPORT_AUDIT_JSONL_STAGE,
+            event="export_complete",
+            entry_count=len(documents),
+            output_path=str(output_path),
+            output_sha256=output_sha256,
+        )
         with get_connection(settings) as conn:
             record_export_artifact(
                 conn,
@@ -122,6 +140,7 @@ def iter_export_records(
     model: str | None,
     prompt_version: str | None,
     include_unenriched: bool,
+    progress_callback: ProgressCallback | None = None,
 ):
     curated_identifier = identifier_from_dotted(curated_table)
     llm_identifier = identifier_from_dotted(llm_table)
@@ -178,8 +197,15 @@ def iter_export_records(
 
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
+            reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_AUDIT_JSONL_STAGE)
+            yielded = 0
             cursor.execute(query, params)
             for curated_run_id, entry_id, lang_code, normalized_word, word, payload, llm_run_id, enrich_model, enrich_prompt_version, response_payload in cursor.fetchall():
+                yielded += 1
+                reporter.report(
+                    event="export_progress",
+                    fetched_records=yielded,
+                )
                 yield {
                     "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
                     "llm_run_id": str(llm_run_id) if llm_run_id is not None else None,
@@ -200,6 +226,7 @@ def iter_export_records(
                         ),
                     },
                 }
+            reporter.report(event="export_progress", force=True, fetched_records=yielded)
 
 
 def iter_export_documents(

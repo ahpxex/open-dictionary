@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress
 
 
 DISTRIBUTION_SCHEMA_VERSION = "distribution_entry_v1"
+
+
+@dataclass(frozen=True)
+class DistributionJSONLValidationResult:
+    output_path: Path
+    entry_count: int
 
 
 def validate_distribution_document(document: dict[str, Any]) -> dict[str, Any]:
@@ -208,3 +219,45 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{field_name} must be a string array")
     return [item.strip() for item in value if item.strip()]
+
+
+def validate_distribution_jsonl_file(
+    path: str | Path,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> DistributionJSONLValidationResult:
+    output_path = Path(path)
+    entry_count = 0
+    reporter = ThrottledProgressReporter(progress_callback, stage="export.distribution_jsonl.validate")
+    emit_progress(
+        progress_callback,
+        stage="export.distribution_jsonl.validate",
+        event="validate_start",
+        input_path=str(output_path),
+    )
+    with output_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{output_path}:{line_number}: invalid JSON: {exc}") from exc
+            try:
+                validate_distribution_document(document)
+            except ValueError as exc:
+                raise ValueError(f"{output_path}:{line_number}: {exc}") from exc
+            entry_count += 1
+            reporter.report(
+                event="validate_progress",
+                line_number=line_number,
+                validated_entries=entry_count,
+            )
+    emit_progress(
+        progress_callback,
+        stage="export.distribution_jsonl.validate",
+        event="validate_complete",
+        input_path=str(output_path),
+        validated_entries=entry_count,
+    )
+    return DistributionJSONLValidationResult(output_path=output_path, entry_count=entry_count)

@@ -9,7 +9,7 @@ from psycopg import sql
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.prompt import DEFINITION_LANGUAGE, PROMPT_VERSION, build_pos_group_id
-from open_dictionary.pipeline import complete_run, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
 from open_dictionary.stages.export_distribution_jsonl.schema import (
     DISTRIBUTION_SCHEMA_VERSION,
     validate_distribution_document,
@@ -34,6 +34,7 @@ def run_export_distribution_jsonl_stage(
     artifact_table: str = "export.artifacts",
     model: str | None = None,
     prompt_version: str = PROMPT_VERSION,
+    progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
     with get_connection(settings) as conn:
         run_id = start_run(
@@ -53,6 +54,13 @@ def run_export_distribution_jsonl_stage(
         )
 
     try:
+        emit_progress(
+            progress_callback,
+            stage=EXPORT_DISTRIBUTION_JSONL_STAGE,
+            event="export_start",
+            model=model,
+            prompt_version=prompt_version,
+        )
         records = list(
             iter_distribution_records(
                 settings=settings,
@@ -60,11 +68,21 @@ def run_export_distribution_jsonl_stage(
                 llm_table=llm_table,
                 model=model,
                 prompt_version=prompt_version,
+                progress_callback=progress_callback,
             )
         )
         documents = [record["document"] for record in records if record["document"] is not None]
         skipped_entries_without_meanings = sum(1 for record in records if record["document"] is None)
         output_sha256 = write_jsonl_atomic(output_path, documents)
+        emit_progress(
+            progress_callback,
+            stage=EXPORT_DISTRIBUTION_JSONL_STAGE,
+            event="export_complete",
+            entry_count=len(documents),
+            skipped_entries_without_meanings=skipped_entries_without_meanings,
+            output_path=str(output_path),
+            output_sha256=output_sha256,
+        )
         curated_run_ids = sorted({record["curated_run_id"] for record in records if record["curated_run_id"]})
         llm_run_ids = sorted({record["llm_run_id"] for record in records if record["llm_run_id"]})
 
@@ -123,6 +141,7 @@ def iter_distribution_records(
     llm_table: str,
     model: str | None,
     prompt_version: str,
+    progress_callback: ProgressCallback | None = None,
 ):
     curated_identifier = identifier_from_dotted(curated_table)
     llm_identifier = identifier_from_dotted(llm_table)
@@ -175,6 +194,9 @@ def iter_distribution_records(
 
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
+            reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_DISTRIBUTION_JSONL_STAGE)
+            processed = 0
+            exported = 0
             cursor.execute(query, params)
             for curated_run_id, llm_run_id, entry_id, _lang_code, _normalized_word, _word, curated_payload, llm_model, llm_prompt_version, response_payload in cursor.fetchall():
                 document = build_distribution_document(
@@ -183,11 +205,24 @@ def iter_distribution_records(
                 )
                 if document is not None:
                     validate_distribution_document(document)
+                    exported += 1
+                processed += 1
+                reporter.report(
+                    event="export_progress",
+                    processed_entries=processed,
+                    exported_entries=exported,
+                )
                 yield {
                     "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
                     "llm_run_id": str(llm_run_id) if llm_run_id is not None else None,
                     "document": document,
                 }
+            reporter.report(
+                event="export_progress",
+                force=True,
+                processed_entries=processed,
+                exported_entries=exported,
+            )
 
 
 def build_distribution_document(

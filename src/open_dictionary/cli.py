@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
 from .config import load_settings
 from .db.bootstrap import LATEST_FOUNDATION_VERSION, apply_foundation
@@ -27,6 +28,7 @@ from .stages.export_distribution_jsonl import (
     DISTRIBUTION_SCHEMA_VERSION,
     EXPORT_DISTRIBUTION_JSONL_STAGE,
     run_export_distribution_jsonl_stage,
+    validate_distribution_jsonl_file,
 )
 from .stages.export_jsonl import (
     EXPORT_AUDIT_JSONL_STAGE,
@@ -49,6 +51,37 @@ def _add_database_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _make_progress_callback():
+    def progress_callback(event: dict[str, object]) -> None:
+        stage = event.get("stage", "unknown")
+        name = event.get("event", "progress")
+        details = " ".join(
+            f"{key}={value}"
+            for key, value in event.items()
+            if key not in {"stage", "event"} and value is not None
+        )
+        message = f"[progress] stage={stage} event={name}"
+        if details:
+            message += f" {details}"
+        print(message, file=sys.stderr, flush=True)
+
+    return progress_callback
+
+
+def _print_command_result(command: str, **payload: object) -> None:
+    print(
+        json.dumps(
+            {
+                "command": command,
+                "status": "succeeded",
+                **payload,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def _get_settings(args: argparse.Namespace):
     try:
         return load_settings(
@@ -57,6 +90,87 @@ def _get_settings(args: argparse.Namespace):
         )
     except RuntimeError as exc:
         args._parser.error(str(exc))
+
+
+def _identifier_from_dotted(qualified_name: str) -> sql.Identifier:
+    parts = [segment.strip() for segment in qualified_name.split(".") if segment.strip()]
+    if not parts:
+        raise ValueError("Identifier name cannot be empty")
+    return sql.Identifier(*parts)
+
+
+def _count_pending_llm_entries(
+    settings,
+    *,
+    source_table: str,
+    target_table: str,
+    prompt_version: str,
+    model: str | None,
+    recompute_existing: bool,
+) -> int:
+    if recompute_existing:
+        with get_connection(settings) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(_identifier_from_dotted(source_table)))
+                return cursor.fetchone()[0]
+
+    query = sql.SQL(
+        """
+        SELECT count(*)
+        FROM {source_table} AS e
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM {target_table} AS x
+            WHERE x.entry_id = e.entry_id
+              AND x.prompt_version = %s
+              AND x.status = 'succeeded'
+              {model_filter}
+        )
+        """
+    ).format(
+        source_table=_identifier_from_dotted(source_table),
+        target_table=_identifier_from_dotted(target_table),
+        model_filter=sql.SQL("AND x.model = %s") if model is not None else sql.SQL(""),
+    )
+    params: list[object] = [prompt_version]
+    if model is not None:
+        params.append(model)
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchone()[0]
+
+
+def _fetch_recent_failed_enrichments(
+    settings,
+    *,
+    target_table: str,
+    prompt_version: str,
+    model: str | None,
+    limit: int,
+) -> list[tuple[str, str]]:
+    query = sql.SQL(
+        """
+        SELECT entry_id::text, left(error, 300)
+        FROM {target_table}
+        WHERE status = 'failed'
+          AND prompt_version = %s
+          {model_filter}
+        ORDER BY enrichment_id DESC
+        LIMIT %s
+        """
+    ).format(
+        target_table=_identifier_from_dotted(target_table),
+        model_filter=sql.SQL("AND model = %s") if model is not None else sql.SQL(""),
+    )
+    params: list[object] = [prompt_version]
+    if model is not None:
+        params.append(model)
+    params.append(limit)
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchall()
 
 
 def _cmd_download(args: argparse.Namespace) -> int:
@@ -71,7 +185,11 @@ def _cmd_download(args: argparse.Namespace) -> int:
     except OSError as exc:
         args._parser.error(str(exc))
 
-    print(f"Downloaded file to {destination}")  # type: ignore[func-returns-value]
+    _print_command_result(
+        "download",
+        output_path=str(destination),
+        source_url=args.url,
+    )
     return 0
 
 
@@ -81,15 +199,18 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
     with get_connection(settings) as conn:
         applied_versions = apply_foundation(conn)
 
-    if applied_versions:
-        print("Applied database migrations: " + ", ".join(applied_versions))
-    else:
-        print(f"Database foundation {LATEST_FOUNDATION_VERSION} is already applied")
+    _print_command_result(
+        "db-init",
+        latest_foundation_version=LATEST_FOUNDATION_VERSION,
+        applied_versions=applied_versions,
+        already_current=not applied_versions,
+    )
     return 0
 
 
 def _cmd_curated_build(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
 
     try:
         result = run_curated_build_stage(
@@ -101,24 +222,26 @@ def _cmd_curated_build(args: argparse.Namespace) -> int:
             lang_codes=args.lang_codes,
             limit_groups=args.limit_groups,
             replace_existing=args.replace_existing,
+            progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError) as exc:
         args._parser.error(f"Database error: {exc}")
 
-    print(
-        "Curated build completed "
-        f"stage={CURATED_BUILD_STAGE} "
-        f"run_id={result.run_id} "
-        f"groups_processed={result.groups_processed} "
-        f"entries_written={result.entries_written} "
-        f"relations_written={result.relations_written} "
-        f"triage_written={result.triage_written}"
+    _print_command_result(
+        "curated-build",
+        stage=CURATED_BUILD_STAGE,
+        run_id=str(result.run_id),
+        groups_processed=result.groups_processed,
+        entries_written=result.entries_written,
+        relations_written=result.relations_written,
+        triage_written=result.triage_written,
     )
     return 0
 
 
 def _cmd_llm_enrich(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
 
     try:
         result = run_llm_enrich_stage(
@@ -131,23 +254,27 @@ def _cmd_llm_enrich(args: argparse.Namespace) -> int:
             max_workers=args.max_workers,
             max_retries=args.max_retries,
             recompute_existing=args.recompute_existing,
+            progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
 
-    print(
-        "LLM enrichment completed "
-        f"stage={LLM_ENRICH_STAGE} "
-        f"run_id={result.run_id} "
-        f"processed={result.processed} "
-        f"succeeded={result.succeeded} "
-        f"failed={result.failed}"
+    _print_command_result(
+        "llm-enrich",
+        stage=LLM_ENRICH_STAGE,
+        run_id=str(result.run_id),
+        processed=result.processed,
+        succeeded=result.succeeded,
+        failed=result.failed,
+        prompt_version=args.prompt_version,
+        max_workers=args.max_workers,
     )
     return 0
 
 
 def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
 
     try:
         result = run_export_audit_jsonl_stage(
@@ -159,6 +286,7 @@ def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
             model=args.model,
             prompt_version=args.prompt_version,
             include_unenriched=args.include_unenriched,
+            progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
@@ -170,19 +298,20 @@ def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    print(
-        "Audit JSONL export completed "
-        f"stage={EXPORT_AUDIT_JSONL_STAGE} "
-        f"run_id={result.run_id} "
-        f"entry_count={result.entry_count} "
-        f"output_path={result.output_path} "
-        f"output_sha256={result.output_sha256}"
+    _print_command_result(
+        "export-audit-jsonl" if getattr(args, "command", None) != "export-jsonl" else "export-jsonl",
+        stage=EXPORT_AUDIT_JSONL_STAGE,
+        run_id=str(result.run_id),
+        entry_count=result.entry_count,
+        output_path=str(result.output_path),
+        output_sha256=result.output_sha256,
     )
     return 0
 
 
 def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
 
     try:
         result = run_export_distribution_jsonl_stage(
@@ -193,18 +322,19 @@ def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
             artifact_table=args.artifact_table,
             model=args.model,
             prompt_version=args.prompt_version,
+            progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
 
-    print(
-        "Distribution JSONL export completed "
-        f"stage={EXPORT_DISTRIBUTION_JSONL_STAGE} "
-        f"schema_version={DISTRIBUTION_SCHEMA_VERSION} "
-        f"run_id={result.run_id} "
-        f"entry_count={result.entry_count} "
-        f"output_path={result.output_path} "
-        f"output_sha256={result.output_sha256}"
+    _print_command_result(
+        "export-distribution-jsonl",
+        stage=EXPORT_DISTRIBUTION_JSONL_STAGE,
+        schema_version=DISTRIBUTION_SCHEMA_VERSION,
+        run_id=str(result.run_id),
+        entry_count=result.entry_count,
+        output_path=str(result.output_path),
+        output_sha256=result.output_sha256,
     )
     return 0
 
@@ -212,6 +342,8 @@ def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
 def _cmd_pipeline_run(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
     llm_env_file = args.llm_env_file or args.env_file
+    worker_tiers = args.worker_tiers or [args.max_workers]
+    progress_callback = _make_progress_callback()
 
     try:
         if not args.skip_db_init:
@@ -229,6 +361,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             archive_path=args.archive_path,
             target_table=args.raw_table,
             overwrite_download=args.overwrite_download,
+            progress_callback=progress_callback,
         )
 
         curated_result = run_curated_build_stage(
@@ -240,24 +373,109 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             lang_codes=args.lang_codes,
             limit_groups=args.limit_groups,
             replace_existing=args.replace_existing_curated,
+            progress_callback=progress_callback,
         )
 
-        llm_result = run_llm_enrich_stage(
-            settings=settings,
-            env_file=llm_env_file,
-            source_table=args.curated_table,
-            target_table=args.llm_table,
-            prompt_version=args.prompt_version,
-            limit_entries=args.limit_entries,
-            max_workers=args.max_workers,
-            max_retries=args.max_retries,
-            recompute_existing=args.recompute_existing,
-        )
-        if llm_result.failed:
-            raise RuntimeError(
-                f"LLM enrichment left {llm_result.failed} failed entries. "
-                "Resolve them or rerun with a safer concurrency before distribution export."
+        llm_attempts: list[dict[str, object]] = []
+        llm_result = None
+        if args.limit_entries is not None:
+            llm_result = run_llm_enrich_stage(
+                settings=settings,
+                env_file=llm_env_file,
+                source_table=args.curated_table,
+                target_table=args.llm_table,
+                prompt_version=args.prompt_version,
+                limit_entries=args.limit_entries,
+                max_workers=worker_tiers[0],
+                max_retries=args.max_retries,
+                recompute_existing=args.recompute_existing,
+                progress_callback=progress_callback,
             )
+            llm_attempts.append(
+                {
+                    "workers": worker_tiers[0],
+                    "processed": llm_result.processed,
+                    "succeeded": llm_result.succeeded,
+                    "failed": llm_result.failed,
+                    "remaining_entries": None,
+                }
+            )
+            if llm_result.failed:
+                raise RuntimeError(
+                    f"LLM enrichment left {llm_result.failed} failed entries in the limited run. "
+                    "Resolve them or rerun with a safer concurrency before export."
+                )
+        else:
+            remaining_entries = _count_pending_llm_entries(
+                settings,
+                source_table=args.curated_table,
+                target_table=args.llm_table,
+                prompt_version=args.prompt_version,
+                model=args.model,
+                recompute_existing=args.recompute_existing,
+            )
+            for workers in worker_tiers:
+                if remaining_entries == 0:
+                    break
+                progress_callback(
+                    {
+                        "stage": "pipeline.run",
+                        "event": "llm_attempt_start",
+                        "workers": workers,
+                        "remaining_entries": remaining_entries,
+                    }
+                )
+                llm_result = run_llm_enrich_stage(
+                    settings=settings,
+                    env_file=llm_env_file,
+                    source_table=args.curated_table,
+                    target_table=args.llm_table,
+                    prompt_version=args.prompt_version,
+                    limit_entries=None,
+                    max_workers=workers,
+                    max_retries=args.max_retries,
+                    recompute_existing=args.recompute_existing,
+                    progress_callback=progress_callback,
+                )
+                remaining_entries = _count_pending_llm_entries(
+                    settings,
+                    source_table=args.curated_table,
+                    target_table=args.llm_table,
+                    prompt_version=args.prompt_version,
+                    model=args.model,
+                    recompute_existing=args.recompute_existing,
+                )
+                llm_attempts.append(
+                    {
+                        "workers": workers,
+                        "processed": llm_result.processed,
+                        "succeeded": llm_result.succeeded,
+                        "failed": llm_result.failed,
+                        "remaining_entries": remaining_entries,
+                    }
+                )
+                progress_callback(
+                    {
+                        "stage": "pipeline.run",
+                        "event": "llm_attempt_complete",
+                        **llm_attempts[-1],
+                    }
+                )
+
+            if remaining_entries != 0:
+                failed_examples = _fetch_recent_failed_enrichments(
+                    settings,
+                    target_table=args.llm_table,
+                    prompt_version=args.prompt_version,
+                    model=args.model,
+                    limit=10,
+                )
+                raise RuntimeError(
+                    f"LLM enrichment still has {remaining_entries} unresolved entries after worker tiers {worker_tiers}. "
+                    f"Recent failed examples: {failed_examples}"
+                )
+
+        assert llm_result is not None
 
         distribution_result = None
         if not args.skip_distribution_export:
@@ -269,7 +487,17 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 artifact_table=args.artifact_table,
                 model=args.model,
                 prompt_version=args.prompt_version,
+                progress_callback=progress_callback,
             )
+            if args.validate_distribution:
+                distribution_validation = validate_distribution_jsonl_file(
+                    args.distribution_output,
+                    progress_callback=progress_callback,
+                )
+            else:
+                distribution_validation = None
+        else:
+            distribution_validation = None
 
         audit_result = None
         if args.audit_output is not None:
@@ -282,6 +510,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 model=args.model,
                 prompt_version=args.prompt_version,
                 include_unenriched=args.include_unenriched_audit,
+                progress_callback=progress_callback,
             )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
@@ -306,7 +535,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             "succeeded": llm_result.succeeded,
             "failed": llm_result.failed,
             "prompt_version": args.prompt_version,
-            "max_workers": args.max_workers,
+            "worker_tiers": worker_tiers,
+            "attempts": llm_attempts,
         },
         "distribution_export": (
             {
@@ -314,6 +544,11 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 "entry_count": distribution_result.entry_count,
                 "output_path": str(distribution_result.output_path),
                 "output_sha256": distribution_result.output_sha256,
+                "validated_entry_count": (
+                    distribution_validation.entry_count
+                    if distribution_validation is not None
+                    else None
+                ),
             }
             if distribution_result is not None
             else None
@@ -329,7 +564,25 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             else None
         ),
     }
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    _print_command_result("pipeline-run", **summary)
+    return 0
+
+
+def _cmd_validate_distribution_jsonl(args: argparse.Namespace) -> int:
+    try:
+        result = validate_distribution_jsonl_file(
+            args.input,
+            progress_callback=_make_progress_callback(),
+        )
+    except ValueError as exc:
+        args._parser.error(str(exc))
+
+    _print_command_result(
+        "validate-distribution-jsonl",
+        schema_version=DISTRIBUTION_SCHEMA_VERSION,
+        output_path=str(result.output_path),
+        entry_count=result.entry_count,
+    )
     return 0
 
 
@@ -345,12 +598,17 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     except OSError as exc:
         args._parser.error(str(exc))
 
-    print(f"Extracted archive to {output}")  # type: ignore[func-returns-value]
+    _print_command_result(
+        "extract",
+        input_path=str(args.input),
+        output_path=str(output),
+    )
     return 0
 
 
 def _cmd_raw_ingest(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
 
     try:
         result = run_raw_ingest_stage(
@@ -364,6 +622,7 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
             archive_path=args.archive_path,
             target_table=args.target_table,
             overwrite_download=args.overwrite_download,
+            progress_callback=progress_callback,
         )
     except FileNotFoundError as exc:
         args._parser.error(str(exc))
@@ -372,15 +631,16 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
     except (psycopg.Error, ValueError) as exc:
         args._parser.error(f"Database error: {exc}")
 
-    print(
-        "Raw ingestion completed "
-        f"stage={RAW_INGEST_STAGE} "
-        f"run_id={result.run_id} "
-        f"snapshot_id={result.snapshot_id} "
-        f"rows_loaded={result.rows_loaded} "
-        f"anomalies_logged={result.anomalies_logged} "
-        f"snapshot_preexisting={result.snapshot_preexisting} "
-        f"archive_sha256={result.archive_sha256}"
+    _print_command_result(
+        "raw-ingest",
+        stage=RAW_INGEST_STAGE,
+        run_id=str(result.run_id),
+        snapshot_id=str(result.snapshot_id),
+        rows_loaded=result.rows_loaded,
+        anomalies_logged=result.anomalies_logged,
+        snapshot_preexisting=result.snapshot_preexisting,
+        archive_path=str(result.archive_path),
+        archive_sha256=result.archive_sha256,
     )
     return 0
 
@@ -612,6 +872,21 @@ def _build_parser() -> argparse.ArgumentParser:
         _parser=export_distribution_jsonl_parser,
     )
 
+    validate_distribution_jsonl_parser = subparsers.add_parser(
+        "validate-distribution-jsonl",
+        help="Validate every row of a learner-facing distribution JSONL file.",
+    )
+    validate_distribution_jsonl_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to a distribution JSONL file to validate.",
+    )
+    validate_distribution_jsonl_parser.set_defaults(
+        func=_cmd_validate_distribution_jsonl,
+        _parser=validate_distribution_jsonl_parser,
+    )
+
     download_parser = subparsers.add_parser(
         "download",
         help="Download a Wiktionary snapshot archive for local inspection or staged ingest.",
@@ -778,7 +1053,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-workers",
         type=int,
         default=4,
-        help="Number of concurrent LLM worker threads (default: %(default)s).",
+        help="Default number of concurrent LLM worker threads when --worker-tiers is not set (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--worker-tiers",
+        nargs="+",
+        type=int,
+        help="Adaptive LLM worker tiers, retried in order until no unresolved entries remain. Example: --worker-tiers 50 12 4 1",
     )
     pipeline_run_parser.add_argument(
         "--max-retries",
@@ -810,6 +1091,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/export/distribution.jsonl"),
         help="Output path for the learner-facing distribution export (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--validate-distribution",
+        action="store_true",
+        help="Validate every distribution JSONL row after export.",
     )
     pipeline_run_parser.add_argument(
         "--audit-output",

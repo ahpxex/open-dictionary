@@ -25,7 +25,7 @@ from open_dictionary.llm.prompt import (
     build_generation_source_payload,
     build_user_prompt,
 )
-from open_dictionary.pipeline import complete_run, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
 
 from .schema import build_expected_generation_targets, validate_enrichment_payload
 
@@ -54,6 +54,7 @@ def run_llm_enrich_stage(
     max_retries: int = 3,
     recompute_existing: bool = False,
     client: OpenAICompatLLMClient | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> LLMEnrichResult:
     llm_settings = load_llm_settings(env_file=env_file)
     llm_client = client or OpenAICompatLLMClient(llm_settings)
@@ -94,6 +95,15 @@ def run_llm_enrich_stage(
             recompute_existing=recompute_existing,
             limit_entries=limit_entries,
         ))
+        emit_progress(
+            progress_callback,
+            stage=LLM_ENRICH_STAGE,
+            event="enrich_start",
+            queued_entries=len(items),
+            max_workers=max_workers,
+            max_retries=max_retries,
+            prompt_version=prompt_version,
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
@@ -108,6 +118,7 @@ def run_llm_enrich_stage(
             }
 
             with get_connection(settings) as conn:
+                reporter = ThrottledProgressReporter(progress_callback, stage=LLM_ENRICH_STAGE)
                 pending_writes = 0
                 for future in concurrent.futures.as_completed(future_map):
                     processed += 1
@@ -139,6 +150,13 @@ def run_llm_enrich_stage(
                     if pending_writes >= PERSIST_COMMIT_INTERVAL:
                         conn.commit()
                         pending_writes = 0
+                    reporter.report(
+                        event="enrich_progress",
+                        processed=processed,
+                        queued_entries=len(items),
+                        succeeded=succeeded,
+                        failed=failed,
+                    )
 
                 if pending_writes:
                     conn.commit()
@@ -153,6 +171,16 @@ def run_llm_enrich_stage(
                         "model": llm_settings.model,
                         "prompt_version": prompt_version,
                     },
+                )
+                emit_progress(
+                    progress_callback,
+                    stage=LLM_ENRICH_STAGE,
+                    event="enrich_complete",
+                    processed=processed,
+                    queued_entries=len(items),
+                    succeeded=succeeded,
+                    failed=failed,
+                    prompt_version=prompt_version,
                 )
 
         return LLMEnrichResult(run_id=run_id, processed=processed, succeeded=succeeded, failed=failed)

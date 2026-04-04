@@ -8,7 +8,7 @@ from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
-from open_dictionary.pipeline import complete_run, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, complete_run, emit_progress, fail_run, start_run
 from open_dictionary.sources.wiktionary import (
     DEFAULT_WIKTIONARY_SOURCE_URL,
     SnapshotRequest,
@@ -41,7 +41,16 @@ def run_raw_ingest_stage(
     archive_path: Path | None = None,
     target_table: str = DEFAULT_RAW_TABLE,
     overwrite_download: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> RawIngestResult:
+    emit_progress(
+        progress_callback,
+        stage=RAW_INGEST_STAGE,
+        event="acquire_start",
+        workdir=str(workdir),
+        source_url=source_url,
+        archive_path=str(archive_path) if archive_path is not None else None,
+    )
     artifact = acquire_snapshot(
         SnapshotRequest(
             workdir=Path(workdir),
@@ -49,6 +58,16 @@ def run_raw_ingest_stage(
             archive_path=archive_path,
             overwrite_download=overwrite_download,
         )
+    )
+    emit_progress(
+        progress_callback,
+        stage=RAW_INGEST_STAGE,
+        event="acquire_complete",
+        archive_path=str(artifact.archive_path),
+        archive_size_bytes=artifact.archive_size_bytes,
+        archive_sha256=artifact.archive_sha256,
+        acquisition_mode=artifact.acquisition_mode,
+        compression=artifact.compression,
     )
 
     with get_connection(settings) as conn:
@@ -79,6 +98,7 @@ def run_raw_ingest_stage(
                 artifact=artifact,
                 target_table=target_table,
                 stage_name=RAW_INGEST_STAGE,
+                progress_callback=progress_callback,
             )
             complete_run(
                 conn,

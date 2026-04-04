@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
-from open_dictionary.pipeline import complete_run, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
 
 from .transform import CuratedBuildOutput, TriageItem, build_curated_entry
 
@@ -40,6 +40,7 @@ def run_curated_build_stage(
     lang_codes: list[str] | None = None,
     limit_groups: int | None = None,
     replace_existing: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> CuratedBuildResult:
     with get_connection(settings) as conn:
         run_id = start_run(
@@ -63,6 +64,15 @@ def run_curated_build_stage(
 
     try:
         with get_connection(settings) as conn:
+            reporter = ThrottledProgressReporter(progress_callback, stage=CURATED_BUILD_STAGE)
+            emit_progress(
+                progress_callback,
+                stage=CURATED_BUILD_STAGE,
+                event="build_start",
+                lang_codes=lang_codes or [],
+                limit_groups=limit_groups,
+                replace_existing=replace_existing,
+            )
             if replace_existing:
                 _reset_outputs(conn, target_table=target_table, relations_table=relations_table, triage_table=triage_table)
 
@@ -89,6 +99,13 @@ def run_curated_build_stage(
                     )
                     relations_written += len(output.relations)
                     triage_written += len(output.triage_items)
+                    reporter.report(
+                        event="build_progress",
+                        groups_processed=groups_processed,
+                        entries_written=entries_written,
+                        relations_written=relations_written,
+                        triage_written=triage_written,
+                    )
                     if limit_groups is not None and groups_processed >= limit_groups:
                         current_rows = []
                         current_key = next_key
@@ -111,6 +128,14 @@ def run_curated_build_stage(
                 )
                 relations_written += len(output.relations)
                 triage_written += len(output.triage_items)
+                reporter.report(
+                    event="build_progress",
+                    force=True,
+                    groups_processed=groups_processed,
+                    entries_written=entries_written,
+                    relations_written=relations_written,
+                    triage_written=triage_written,
+                )
 
             complete_run(
                 conn,
@@ -121,6 +146,15 @@ def run_curated_build_stage(
                     "relations_written": relations_written,
                     "triage_written": triage_written,
                 },
+            )
+            emit_progress(
+                progress_callback,
+                stage=CURATED_BUILD_STAGE,
+                event="build_complete",
+                groups_processed=groups_processed,
+                entries_written=entries_written,
+                relations_written=relations_written,
+                triage_written=triage_written,
             )
 
         return CuratedBuildResult(
