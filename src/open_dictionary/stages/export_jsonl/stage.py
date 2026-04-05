@@ -11,11 +11,13 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
+from open_dictionary.llm.prompt import build_prompt_bundle
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
 
 
-EXPORT_AUDIT_JSONL_STAGE = "export.audit_jsonl"
+EXPORT_AUDIT_JSONL_STAGE = "audit.export"
 # Backward-compatible alias while the CLI migrates away from the ambiguous
 # export-jsonl naming.
 EXPORT_JSONL_STAGE = EXPORT_AUDIT_JSONL_STAGE
@@ -38,9 +40,20 @@ def run_export_jsonl_stage(
     artifact_table: str = "export.artifacts",
     model: str | None = None,
     prompt_version: str | None = None,
+    definition_language: LanguageSpec | dict[str, Any] = DEFAULT_DEFINITION_LANGUAGE,
     include_unenriched: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
+    language = normalize_language_spec(definition_language)
+    prompt_bundle = (
+        build_prompt_bundle(
+            prompt_version=prompt_version,
+            definition_language=language,
+        )
+        if prompt_version is not None
+        else None
+    )
+
     with get_connection(settings) as conn:
         run_id = start_run(
             conn,
@@ -48,10 +61,16 @@ def run_export_jsonl_stage(
             config={
                 "output_path": str(output_path),
                 "curated_table": curated_table,
-                "llm_table": llm_table,
+                "definitions_table": llm_table,
                 "artifact_table": artifact_table,
                 "model": model,
-                "prompt_version": prompt_version,
+                "prompt_template_version": (
+                    prompt_bundle.template_version if prompt_bundle is not None else None
+                ),
+                "prompt_version": (
+                    prompt_bundle.resolved_prompt_version if prompt_bundle is not None else None
+                ),
+                "definition_language": language.as_dict(),
                 "include_unenriched": include_unenriched,
                 "artifact_role": "audit",
             },
@@ -64,7 +83,13 @@ def run_export_jsonl_stage(
             event="export_start",
             include_unenriched=include_unenriched,
             model=model,
-            prompt_version=prompt_version,
+            prompt_version=(
+                prompt_bundle.resolved_prompt_version if prompt_bundle is not None else None
+            ),
+            prompt_template_version=(
+                prompt_bundle.template_version if prompt_bundle is not None else None
+            ),
+            definition_language_code=language.code,
         )
         records = list(
             iter_export_records(
@@ -72,7 +97,8 @@ def run_export_jsonl_stage(
                 curated_table=curated_table,
                 llm_table=llm_table,
                 model=model,
-                prompt_version=prompt_version,
+                prompt_bundle=prompt_bundle,
+                definition_language=language,
                 include_unenriched=include_unenriched,
                 progress_callback=progress_callback,
             )
@@ -100,13 +126,19 @@ def run_export_jsonl_stage(
                 entry_count=len(documents),
                 metadata={
                     "curated_table": curated_table,
-                    "llm_table": llm_table,
+                    "definitions_table": llm_table,
                     "model": model,
-                    "prompt_version": prompt_version,
+                    "prompt_template_version": (
+                        prompt_bundle.template_version if prompt_bundle is not None else None
+                    ),
+                    "prompt_version": (
+                        prompt_bundle.resolved_prompt_version if prompt_bundle is not None else None
+                    ),
+                    "definition_language": language.as_dict(),
                     "include_unenriched": include_unenriched,
                     "artifact_role": "audit",
                     "curated_run_ids": curated_run_ids,
-                    "llm_run_ids": llm_run_ids,
+                    "definition_run_ids": llm_run_ids,
                 },
             )
             complete_run(
@@ -116,8 +148,9 @@ def run_export_jsonl_stage(
                     "output_path": str(output_path),
                     "entry_count": len(documents),
                     "output_sha256": output_sha256,
+                    "definition_language": language.as_dict(),
                     "curated_run_ids": curated_run_ids,
-                    "llm_run_ids": llm_run_ids,
+                    "definition_run_ids": llm_run_ids,
                 },
             )
         return ExportJSONLResult(
@@ -138,10 +171,12 @@ def iter_export_records(
     curated_table: str,
     llm_table: str,
     model: str | None,
-    prompt_version: str | None,
+    prompt_bundle,
+    definition_language: LanguageSpec | dict[str, Any],
     include_unenriched: bool,
     progress_callback: ProgressCallback | None = None,
 ):
+    language = normalize_language_spec(definition_language)
     curated_identifier = identifier_from_dotted(curated_table)
     llm_identifier = identifier_from_dotted(llm_table)
 
@@ -152,19 +187,22 @@ def iter_export_records(
             entry_id,
             model,
             prompt_version,
+            definition_language_code,
+            definition_language_name,
             response_payload
         FROM {}
         WHERE status = 'succeeded'
+          AND definition_language_code = %s
         """
     ).format(llm_identifier)
 
-    params: list[Any] = []
+    params: list[Any] = [language.code]
     if model is not None:
         latest_enrichment_sql += sql.SQL(" AND model = %s")
         params.append(model)
-    if prompt_version is not None:
+    if prompt_bundle is not None:
         latest_enrichment_sql += sql.SQL(" AND prompt_version = %s")
-        params.append(prompt_version)
+        params.append(prompt_bundle.resolved_prompt_version)
     latest_enrichment_sql += sql.SQL(" ORDER BY entry_id, created_at DESC")
 
     join_type = sql.SQL("LEFT JOIN") if include_unenriched else sql.SQL("JOIN")
@@ -183,6 +221,8 @@ def iter_export_records(
             l.run_id,
             l.model,
             l.prompt_version,
+            l.definition_language_code,
+            l.definition_language_name,
             l.response_payload
         FROM {curated_table} AS e
         {join_type} latest_enrichment AS l
@@ -200,7 +240,7 @@ def iter_export_records(
             reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_AUDIT_JSONL_STAGE)
             yielded = 0
             cursor.execute(query, params)
-            for curated_run_id, entry_id, lang_code, normalized_word, word, payload, llm_run_id, enrich_model, enrich_prompt_version, response_payload in cursor.fetchall():
+            for curated_run_id, entry_id, lang_code, normalized_word, word, payload, llm_run_id, enrich_model, enrich_prompt_version, definition_language_code, definition_language_name, response_payload in cursor.fetchall():
                 yielded += 1
                 reporter.report(
                     event="export_progress",
@@ -214,11 +254,15 @@ def iter_export_records(
                         "lang_code": lang_code,
                         "normalized_word": normalized_word,
                         "word": word,
-                        "curated": payload,
-                        "llm": (
+                        "entries": payload,
+                        "definitions": (
                             {
                                 "model": enrich_model,
                                 "prompt_version": enrich_prompt_version,
+                                "definition_language": {
+                                    "code": definition_language_code,
+                                    "name": definition_language_name,
+                                },
                                 "payload": response_payload,
                             }
                             if response_payload is not None
@@ -235,7 +279,8 @@ def iter_export_documents(
     curated_table: str,
     llm_table: str,
     model: str | None,
-    prompt_version: str | None,
+    prompt_bundle,
+    definition_language: LanguageSpec | dict[str, Any],
     include_unenriched: bool,
 ):
     for record in iter_export_records(
@@ -243,7 +288,8 @@ def iter_export_documents(
         curated_table=curated_table,
         llm_table=llm_table,
         model=model,
-        prompt_version=prompt_version,
+        prompt_bundle=prompt_bundle,
+        definition_language=definition_language,
         include_unenriched=include_unenriched,
     ):
         yield record["document"]

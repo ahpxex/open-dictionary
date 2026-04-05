@@ -12,25 +12,17 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
 from open_dictionary.llm.config import load_llm_settings
-from open_dictionary.llm.prompt import (
-    COMPACT_RETRY_MAX_TOKENS,
-    COMPACT_RETRY_SYSTEM_PROMPT,
-    DEFAULT_MAX_TOKENS,
-    OUTPUT_CONTRACT,
-    PROMPT_VERSION,
-    SYSTEM_PROMPT,
-    build_generation_source_payload,
-    build_user_prompt,
-)
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
+from open_dictionary.llm.prompt import COMPACT_RETRY_MAX_TOKENS, DEFAULT_MAX_TOKENS, PROMPT_VERSION, PromptBundle, build_generation_source_payload, build_prompt_bundle, build_user_prompt
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
 
 from .schema import build_expected_generation_targets, validate_enrichment_payload
 
 
-LLM_ENRICH_STAGE = "llm.enrich"
+LLM_ENRICH_STAGE = "definitions.generate"
 PERSIST_COMMIT_INTERVAL = 25
 
 
@@ -49,6 +41,7 @@ def run_llm_enrich_stage(
     source_table: str = "curated.entries",
     target_table: str = "llm.entry_enrichments",
     prompt_version: str = PROMPT_VERSION,
+    definition_language: LanguageSpec | dict[str, Any] = DEFAULT_DEFINITION_LANGUAGE,
     limit_entries: int | None = None,
     max_workers: int = 4,
     max_retries: int = 3,
@@ -58,6 +51,11 @@ def run_llm_enrich_stage(
 ) -> LLMEnrichResult:
     llm_settings = load_llm_settings(env_file=env_file)
     llm_client = client or OpenAICompatLLMClient(llm_settings)
+    language = normalize_language_spec(definition_language)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=prompt_version,
+        definition_language=language,
+    )
 
     with get_connection(settings) as conn:
         run_id = start_run(
@@ -66,7 +64,9 @@ def run_llm_enrich_stage(
             config={
                 "source_table": source_table,
                 "target_table": target_table,
-                "prompt_version": prompt_version,
+                "prompt_template_version": prompt_bundle.template_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": language.as_dict(),
                 "model": llm_settings.model,
                 "limit_entries": limit_entries,
                 "max_workers": max_workers,
@@ -74,35 +74,34 @@ def run_llm_enrich_stage(
                 "recompute_existing": recompute_existing,
             },
         )
-        ensure_prompt_version(
-            conn,
-            prompt_version=prompt_version,
-            prompt_text=SYSTEM_PROMPT,
-            output_contract=OUTPUT_CONTRACT,
-        )
+        ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
 
     processed = 0
     succeeded = 0
     failed = 0
 
     try:
-        items = list(iter_curated_entries(
-            settings,
-            source_table=source_table,
-            target_table=target_table,
-            prompt_version=prompt_version,
-            model=llm_settings.model,
-            recompute_existing=recompute_existing,
-            limit_entries=limit_entries,
-        ))
+        items = list(
+            iter_curated_entries(
+                settings,
+                source_table=source_table,
+                target_table=target_table,
+                prompt_bundle=prompt_bundle,
+                model=llm_settings.model,
+                recompute_existing=recompute_existing,
+                limit_entries=limit_entries,
+            )
+        )
         emit_progress(
             progress_callback,
             stage=LLM_ENRICH_STAGE,
-            event="enrich_start",
+            event="generate_start",
             queued_entries=len(items),
             max_workers=max_workers,
             max_retries=max_retries,
-            prompt_version=prompt_version,
+            prompt_version=prompt_bundle.resolved_prompt_version,
+            prompt_template_version=prompt_bundle.template_version,
+            definition_language_code=language.code,
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -110,7 +109,7 @@ def run_llm_enrich_stage(
                     enrich_one_entry,
                     entry=item,
                     llm_client=llm_client,
-                    prompt_version=prompt_version,
+                    prompt_bundle=prompt_bundle,
                     model=llm_settings.model,
                     max_retries=max_retries,
                 ): item
@@ -132,7 +131,8 @@ def run_llm_enrich_stage(
                             run_id=run_id,
                             entry_id=future_map[future]["entry_id"],
                             model=llm_settings.model,
-                            prompt_version=prompt_version,
+                            prompt_version=prompt_bundle.resolved_prompt_version,
+                            definition_language=language,
                             input_hash=future_map[future]["input_hash"],
                             request_payload=future_map[future]["request_payload"],
                             retries=max_retries,
@@ -151,7 +151,7 @@ def run_llm_enrich_stage(
                         conn.commit()
                         pending_writes = 0
                     reporter.report(
-                        event="enrich_progress",
+                        event="generate_progress",
                         processed=processed,
                         queued_entries=len(items),
                         succeeded=succeeded,
@@ -169,18 +169,22 @@ def run_llm_enrich_stage(
                         "succeeded": succeeded,
                         "failed": failed,
                         "model": llm_settings.model,
-                        "prompt_version": prompt_version,
+                        "prompt_template_version": prompt_bundle.template_version,
+                        "prompt_version": prompt_bundle.resolved_prompt_version,
+                        "definition_language": language.as_dict(),
                     },
                 )
                 emit_progress(
                     progress_callback,
                     stage=LLM_ENRICH_STAGE,
-                    event="enrich_complete",
+                    event="generate_complete",
                     processed=processed,
                     queued_entries=len(items),
                     succeeded=succeeded,
                     failed=failed,
-                    prompt_version=prompt_version,
+                    prompt_version=prompt_bundle.resolved_prompt_version,
+                    prompt_template_version=prompt_bundle.template_version,
+                    definition_language_code=language.code,
                 )
 
         return LLMEnrichResult(run_id=run_id, processed=processed, succeeded=succeeded, failed=failed)
@@ -190,15 +194,29 @@ def run_llm_enrich_stage(
         raise
 
 
-def ensure_prompt_version(conn, *, prompt_version: str, prompt_text: str, output_contract: dict[str, Any]) -> None:
+def ensure_prompt_version(conn, *, prompt_bundle: PromptBundle) -> None:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO llm.prompt_versions (prompt_version, prompt_text, output_contract)
-            VALUES (%s, %s, %s)
+            INSERT INTO llm.prompt_versions (
+                prompt_version,
+                prompt_text,
+                output_contract,
+                definition_language_code,
+                definition_language_name,
+                prompt_bundle
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (prompt_version) DO NOTHING
             """,
-            (prompt_version, prompt_text, Jsonb(output_contract)),
+            (
+                prompt_bundle.resolved_prompt_version,
+                prompt_bundle.system_prompt,
+                Jsonb(prompt_bundle.output_contract),
+                prompt_bundle.definition_language.code,
+                prompt_bundle.definition_language.name,
+                Jsonb(prompt_bundle.as_metadata()),
+            ),
         )
     conn.commit()
 
@@ -208,7 +226,7 @@ def iter_curated_entries(
     *,
     source_table: str,
     target_table: str,
-    prompt_version: str,
+    prompt_bundle: PromptBundle,
     model: str,
     recompute_existing: bool,
     limit_entries: int | None,
@@ -231,11 +249,18 @@ def iter_curated_entries(
                 WHERE x.entry_id = e.entry_id
                   AND x.model = %s
                   AND x.prompt_version = %s
+                  AND x.definition_language_code = %s
                   AND x.status = 'succeeded'
             )
             """
         ).format(target_identifier)
-        params.extend((model, prompt_version))
+        params.extend(
+            (
+                model,
+                prompt_bundle.resolved_prompt_version,
+                prompt_bundle.definition_language.code,
+            )
+        )
     query += sql.SQL(" ORDER BY e.lang_code, e.normalized_word")
     if limit_entries is not None:
         query += sql.SQL(" LIMIT %s")
@@ -246,8 +271,13 @@ def iter_curated_entries(
             cursor.execute(query, params)
             for entry_id, payload in cursor.fetchall():
                 request_payload = {
-                    "entry": build_generation_source_payload(payload),
-                    "prompt_version": prompt_version,
+                    "entry": build_generation_source_payload(
+                        payload,
+                        definition_language=prompt_bundle.definition_language,
+                    ),
+                    "prompt_template_version": prompt_bundle.template_version,
+                    "prompt_version": prompt_bundle.resolved_prompt_version,
+                    "definition_language": prompt_bundle.definition_language.as_dict(),
                 }
                 yield {
                     "entry_id": entry_id,
@@ -261,7 +291,7 @@ def enrich_one_entry(
     *,
     entry: dict[str, Any],
     llm_client: OpenAICompatLLMClient,
-    prompt_version: str,
+    prompt_bundle: PromptBundle,
     model: str,
     max_retries: int,
 ) -> dict[str, Any]:
@@ -274,7 +304,11 @@ def enrich_one_entry(
 
     for attempt in range(1, max_retries + 1):
         use_compact_retry_prompt = attempt > 1
-        system_prompt = COMPACT_RETRY_SYSTEM_PROMPT if use_compact_retry_prompt else SYSTEM_PROMPT
+        system_prompt = (
+            prompt_bundle.compact_retry_system_prompt
+            if use_compact_retry_prompt
+            else prompt_bundle.system_prompt
+        )
         max_tokens = COMPACT_RETRY_MAX_TOKENS if use_compact_retry_prompt else DEFAULT_MAX_TOKENS
         try:
             raw_response = llm_client.generate_json(
@@ -291,7 +325,9 @@ def enrich_one_entry(
             return {
                 "entry_id": entry["entry_id"],
                 "model": model,
-                "prompt_version": prompt_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "prompt_template_version": prompt_bundle.template_version,
+                "definition_language": prompt_bundle.definition_language,
                 "input_hash": input_hash,
                 "request_payload": request_payload,
                 "response_payload": validated,
@@ -310,6 +346,7 @@ def enrich_one_entry(
 
 def persist_enrichment_success(conn, *, target_table: str, run_id: UUID, record: dict[str, Any]) -> None:
     target_identifier = identifier_from_dotted(target_table)
+    definition_language = normalize_language_spec(record["definition_language"])
     with conn.cursor() as cursor:
         cursor.execute(
             sql.SQL(
@@ -319,13 +356,15 @@ def persist_enrichment_success(conn, *, target_table: str, run_id: UUID, record:
                     entry_id,
                     model,
                     prompt_version,
+                    definition_language_code,
+                    definition_language_name,
                     input_hash,
                     status,
                     request_payload,
                     response_payload,
                     raw_response,
                     retries
-                ) VALUES (%s, %s, %s, %s, %s, 'succeeded', %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'succeeded', %s, %s, %s, %s)
                 """
             ).format(target_identifier),
             (
@@ -333,6 +372,8 @@ def persist_enrichment_success(conn, *, target_table: str, run_id: UUID, record:
                 record["entry_id"],
                 record["model"],
                 record["prompt_version"],
+                definition_language.code,
+                definition_language.name,
                 record["input_hash"],
                 Jsonb(record["request_payload"]),
                 Jsonb(record["response_payload"]),
@@ -340,6 +381,8 @@ def persist_enrichment_success(conn, *, target_table: str, run_id: UUID, record:
                 record["retries"],
             ),
         )
+
+
 def persist_enrichment_failure(
     conn,
     *,
@@ -348,12 +391,14 @@ def persist_enrichment_failure(
     entry_id: str,
     model: str,
     prompt_version: str,
+    definition_language: LanguageSpec | dict[str, Any],
     input_hash: str,
     request_payload: dict[str, Any],
     retries: int,
     error: str,
 ) -> None:
     target_identifier = identifier_from_dotted(target_table)
+    language = normalize_language_spec(definition_language)
     with conn.cursor() as cursor:
         cursor.execute(
             sql.SQL(
@@ -363,12 +408,14 @@ def persist_enrichment_failure(
                     entry_id,
                     model,
                     prompt_version,
+                    definition_language_code,
+                    definition_language_name,
                     input_hash,
                     status,
                     request_payload,
                     error,
                     retries
-                ) VALUES (%s, %s, %s, %s, %s, 'failed', %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'failed', %s, %s, %s)
                 """
             ).format(target_identifier),
             (
@@ -376,12 +423,16 @@ def persist_enrichment_failure(
                 entry_id,
                 model,
                 prompt_version,
+                language.code,
+                language.name,
                 input_hash,
                 Jsonb(request_payload),
                 error,
                 retries,
             ),
         )
+
+
 def compute_input_hash(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

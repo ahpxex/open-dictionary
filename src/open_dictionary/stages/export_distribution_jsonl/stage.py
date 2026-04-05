@@ -2,27 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from uuid import UUID
 
 from psycopg import sql
 
 from open_dictionary.config import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
-from open_dictionary.llm.prompt import DEFINITION_LANGUAGE, PROMPT_VERSION, build_pos_group_id
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, emit_progress, complete_run, fail_run, start_run
-from open_dictionary.stages.export_distribution_jsonl.schema import (
-    DISTRIBUTION_SCHEMA_VERSION,
-    validate_distribution_document,
-)
-from open_dictionary.stages.export_jsonl.stage import (
-    ExportJSONLResult,
-    identifier_from_dotted,
-    record_export_artifact,
-    write_jsonl_atomic,
-)
+from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id, build_prompt_bundle
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
+from open_dictionary.stages.export_distribution_jsonl.schema import DISTRIBUTION_SCHEMA_VERSION, validate_distribution_document
+from open_dictionary.stages.export_jsonl.stage import ExportJSONLResult, identifier_from_dotted, record_export_artifact, write_jsonl_atomic
 
 
-EXPORT_DISTRIBUTION_JSONL_STAGE = "export.distribution_jsonl"
+EXPORT_DISTRIBUTION_JSONL_STAGE = "distribution.export"
 
 
 def run_export_distribution_jsonl_stage(
@@ -34,8 +26,15 @@ def run_export_distribution_jsonl_stage(
     artifact_table: str = "export.artifacts",
     model: str | None = None,
     prompt_version: str = PROMPT_VERSION,
+    definition_language: LanguageSpec | dict[str, Any] = DEFAULT_DEFINITION_LANGUAGE,
     progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
+    language = normalize_language_spec(definition_language)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=prompt_version,
+        definition_language=language,
+    )
+
     with get_connection(settings) as conn:
         run_id = start_run(
             conn,
@@ -43,13 +42,14 @@ def run_export_distribution_jsonl_stage(
             config={
                 "output_path": str(output_path),
                 "curated_table": curated_table,
-                "llm_table": llm_table,
+                "definitions_table": llm_table,
                 "artifact_table": artifact_table,
                 "model": model,
-                "prompt_version": prompt_version,
+                "prompt_template_version": prompt_bundle.template_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
                 "schema_version": DISTRIBUTION_SCHEMA_VERSION,
                 "artifact_role": "distribution",
-                "definition_language": DEFINITION_LANGUAGE,
+                "definition_language": language.as_dict(),
             },
         )
 
@@ -59,7 +59,9 @@ def run_export_distribution_jsonl_stage(
             stage=EXPORT_DISTRIBUTION_JSONL_STAGE,
             event="export_start",
             model=model,
-            prompt_version=prompt_version,
+            prompt_version=prompt_bundle.resolved_prompt_version,
+            prompt_template_version=prompt_bundle.template_version,
+            definition_language_code=language.code,
         )
         records = list(
             iter_distribution_records(
@@ -67,7 +69,7 @@ def run_export_distribution_jsonl_stage(
                 curated_table=curated_table,
                 llm_table=llm_table,
                 model=model,
-                prompt_version=prompt_version,
+                prompt_bundle=prompt_bundle,
                 progress_callback=progress_callback,
             )
         )
@@ -97,14 +99,15 @@ def run_export_distribution_jsonl_stage(
                 entry_count=len(documents),
                 metadata={
                     "curated_table": curated_table,
-                    "llm_table": llm_table,
+                    "definitions_table": llm_table,
                     "model": model,
-                    "prompt_version": prompt_version,
+                    "prompt_template_version": prompt_bundle.template_version,
+                    "prompt_version": prompt_bundle.resolved_prompt_version,
                     "schema_version": DISTRIBUTION_SCHEMA_VERSION,
                     "artifact_role": "distribution",
-                    "definition_language": DEFINITION_LANGUAGE,
+                    "definition_language": language.as_dict(),
                     "curated_run_ids": curated_run_ids,
-                    "llm_run_ids": llm_run_ids,
+                    "definition_run_ids": llm_run_ids,
                     "skipped_entries_without_meanings": skipped_entries_without_meanings,
                 },
             )
@@ -116,8 +119,9 @@ def run_export_distribution_jsonl_stage(
                     "entry_count": len(documents),
                     "output_sha256": output_sha256,
                     "curated_run_ids": curated_run_ids,
-                    "llm_run_ids": llm_run_ids,
+                    "definition_run_ids": llm_run_ids,
                     "schema_version": DISTRIBUTION_SCHEMA_VERSION,
+                    "definition_language": language.as_dict(),
                     "skipped_entries_without_meanings": skipped_entries_without_meanings,
                 },
             )
@@ -140,7 +144,7 @@ def iter_distribution_records(
     curated_table: str,
     llm_table: str,
     model: str | None,
-    prompt_version: str,
+    prompt_bundle,
     progress_callback: ProgressCallback | None = None,
 ):
     curated_identifier = identifier_from_dotted(curated_table)
@@ -153,14 +157,20 @@ def iter_distribution_records(
             entry_id,
             model,
             prompt_version,
+            definition_language_code,
+            definition_language_name,
             response_payload
         FROM {}
         WHERE status = 'succeeded'
           AND prompt_version = %s
+          AND definition_language_code = %s
         """
     ).format(llm_identifier)
 
-    params: list[Any] = [prompt_version]
+    params: list[Any] = [
+        prompt_bundle.resolved_prompt_version,
+        prompt_bundle.definition_language.code,
+    ]
     if model is not None:
         latest_enrichment_sql += sql.SQL(" AND model = %s")
         params.append(model)
@@ -181,6 +191,8 @@ def iter_distribution_records(
             e.payload,
             l.model,
             l.prompt_version,
+            l.definition_language_code,
+            l.definition_language_name,
             l.response_payload
         FROM {curated_table} AS e
         JOIN latest_enrichment AS l
@@ -198,10 +210,20 @@ def iter_distribution_records(
             processed = 0
             exported = 0
             cursor.execute(query, params)
-            for curated_run_id, llm_run_id, entry_id, _lang_code, _normalized_word, _word, curated_payload, llm_model, llm_prompt_version, response_payload in cursor.fetchall():
+            for curated_run_id, llm_run_id, entry_id, _lang_code, _normalized_word, _word, curated_payload, llm_model, llm_prompt_version, llm_definition_language_code, llm_definition_language_name, response_payload in cursor.fetchall():
+                if (
+                    llm_definition_language_code != prompt_bundle.definition_language.code
+                    or (llm_definition_language_name or "").strip() != prompt_bundle.definition_language.name
+                ):
+                    raise ValueError(
+                        "Selected enrichment does not match the requested definition language contract: "
+                        f"expected {prompt_bundle.definition_language.as_dict()}, "
+                        f"got {{'code': {llm_definition_language_code!r}, 'name': {llm_definition_language_name!r}}}"
+                    )
                 document = build_distribution_document(
                     curated_payload=curated_payload,
                     llm_payload=response_payload,
+                    definition_language=prompt_bundle.definition_language,
                 )
                 if document is not None:
                     validate_distribution_document(document)
@@ -229,7 +251,9 @@ def build_distribution_document(
     *,
     curated_payload: dict[str, Any],
     llm_payload: dict[str, Any],
+    definition_language: LanguageSpec | dict[str, Any],
 ) -> dict[str, Any] | None:
+    language = normalize_language_spec(definition_language)
     if not isinstance(curated_payload, dict):
         raise ValueError("Curated payload must be a JSON object")
     if not isinstance(llm_payload, dict):
@@ -270,7 +294,7 @@ def build_distribution_document(
             "code": curated_payload["lang_code"],
             "name": curated_payload["lang"],
         },
-        "definition_language": DEFINITION_LANGUAGE,
+        "definition_language": language.as_dict(),
         "entry_type": derive_entry_type(curated_payload.get("entry_flags") or []),
         "headword_summary": llm_payload["headword_summary"],
         "study_notes": llm_payload["study_notes"],
@@ -377,9 +401,9 @@ def build_distribution_pos_group(
 
 
 def derive_entry_type(entry_flags: list[str]) -> str:
-    entry_flags = list(entry_flags)
-    if "entry_type:proverb" in entry_flags:
+    flag_set = set(entry_flags)
+    if "entry_type:proverb" in flag_set:
         return "proverb"
-    if "entry_type:affix" in entry_flags:
+    if "entry_type:affix" in flag_set:
         return "affix"
     return "standard"

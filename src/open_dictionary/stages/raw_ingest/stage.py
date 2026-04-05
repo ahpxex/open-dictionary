@@ -18,7 +18,7 @@ from open_dictionary.sources.wiktionary import (
 from .loader import load_snapshot
 
 
-RAW_INGEST_STAGE = "wiktionary.raw_ingest"
+RAW_INGEST_STAGE = "source.ingest"
 DEFAULT_RAW_TABLE = "raw.wiktionary_entries"
 
 

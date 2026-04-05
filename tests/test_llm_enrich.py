@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from open_dictionary.config.settings import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
@@ -15,6 +16,7 @@ from open_dictionary.llm.config import LLMSettings
 from open_dictionary.llm.config import load_llm_settings
 from open_dictionary.llm.prompt import (
     PROMPT_VERSION,
+    build_prompt_bundle,
     build_generation_source_payload,
     build_pos_group_id,
     build_user_prompt,
@@ -44,6 +46,12 @@ class FakeLLMClient:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+ENGLISH_DEFINITION_LANGUAGE = {
+    "code": "en",
+    "name": "English",
+}
 
 
 def valid_payload(
@@ -78,7 +86,7 @@ def valid_payload(
 
 def seed_curated_entry(conn, *, word: str = "cat", lang_code: str = "en", pos: str = "noun") -> str:
     entry_id = str(uuid4())
-    run_id = start_run(conn, stage="curated.build")
+    run_id = start_run(conn, stage="entries.assemble")
     payload = {
         "entry_id": entry_id,
         "word": word,
@@ -167,10 +175,28 @@ def test_load_llm_settings_raises_when_api_is_missing(tmp_path: Path, monkeypatc
 
 def test_build_user_prompt_embeds_curated_payload() -> None:
     # This case verifies that prompt rendering keeps the full curated structure available to the model.
-    prompt = build_user_prompt(build_generation_source_payload({"word": "cat", "lang": "English", "lang_code": "en", "pos_groups": []}))
+    prompt = build_user_prompt(
+        build_generation_source_payload(
+            {"word": "cat", "lang": "English", "lang_code": "en", "pos_groups": []},
+            definition_language=ENGLISH_DEFINITION_LANGUAGE,
+        )
+    )
 
     assert "Generated-field source payload" in prompt
     assert '"headword": "cat"' in prompt
+    assert '"definition_language": {' in prompt
+    assert '"code": "en"' in prompt
+
+
+def test_build_prompt_bundle_resolves_language_specific_prompt_version() -> None:
+    bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
+    )
+
+    assert bundle.template_version == PROMPT_VERSION
+    assert bundle.resolved_prompt_version.endswith("__deflang__en")
+    assert "required definition language for this run is English (en)" in bundle.system_prompt
 
 
 def test_validate_enrichment_payload_accepts_valid_shape() -> None:
@@ -305,6 +331,10 @@ def test_compute_input_hash_is_stable() -> None:
 def test_enrich_one_entry_succeeds_with_fake_client() -> None:
     # This case covers the happy-path single-entry enrichment flow.
     client = FakeLLMClient([json.dumps(valid_payload("noun"))])
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     request_entry = build_generation_source_payload(
         {
             "entry_id": "entry-1",
@@ -327,7 +357,7 @@ def test_enrich_one_entry_succeeds_with_fake_client() -> None:
     record = llm_stage.enrich_one_entry(
         entry=entry,
         llm_client=client,
-        prompt_version=PROMPT_VERSION,
+        prompt_bundle=prompt_bundle,
         model="test-model",
         max_retries=2,
     )
@@ -340,6 +370,10 @@ def test_enrich_one_entry_succeeds_with_fake_client() -> None:
 def test_enrich_one_entry_retries_before_success() -> None:
     # This case verifies that transient model failures are retried instead of immediately failing the stage.
     client = FakeLLMClient([ValueError("bad"), json.dumps(valid_payload("noun"))])
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     request_entry = build_generation_source_payload(
         {
             "entry_id": "entry-1",
@@ -362,7 +396,7 @@ def test_enrich_one_entry_retries_before_success() -> None:
     record = llm_stage.enrich_one_entry(
         entry=entry,
         llm_client=client,
-        prompt_version=PROMPT_VERSION,
+        prompt_bundle=prompt_bundle,
         model="test-model",
         max_retries=2,
     )
@@ -375,6 +409,10 @@ def test_enrich_one_entry_retries_before_success() -> None:
 def test_enrich_one_entry_raises_after_max_retries() -> None:
     # This case ensures persistent invalid outputs bubble up as failures.
     client = FakeLLMClient([ValueError("bad"), ValueError("still bad")])
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     request_entry = build_generation_source_payload(
         {
             "entry_id": "entry-1",
@@ -398,7 +436,7 @@ def test_enrich_one_entry_raises_after_max_retries() -> None:
         llm_stage.enrich_one_entry(
             entry=entry,
             llm_client=client,
-            prompt_version=PROMPT_VERSION,
+            prompt_bundle=prompt_bundle,
             model="test-model",
             max_retries=2,
         )
@@ -426,12 +464,19 @@ def test_openai_client_wraps_timeout_error(monkeypatch: pytest.MonkeyPatch) -> N
 def test_ensure_prompt_version_is_idempotent(temp_database_url: str) -> None:
     # This case prevents duplicate prompt metadata rows for the same version string.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version="v-test",
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
-        llm_stage.ensure_prompt_version(conn, prompt_version="v-test", prompt_text="prompt", output_contract={"type": "object"})
-        llm_stage.ensure_prompt_version(conn, prompt_version="v-test", prompt_text="prompt", output_contract={"type": "object"})
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
         with conn.cursor() as cursor:
-            cursor.execute("select count(*) from llm.prompt_versions where prompt_version = 'v-test'")
+            cursor.execute(
+                "select count(*) from llm.prompt_versions where prompt_version = %s",
+                (prompt_bundle.resolved_prompt_version,),
+            )
             count = cursor.fetchone()[0]
 
     assert count == 1
@@ -440,15 +485,19 @@ def test_ensure_prompt_version_is_idempotent(temp_database_url: str) -> None:
 def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -> None:
     # This case verifies that reruns do not keep sending already-enriched entries back to the model.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn)
-        llm_stage.ensure_prompt_version(conn, prompt_version=PROMPT_VERSION, prompt_text="prompt", output_contract={"type": "object"})
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
         with conn.cursor() as cursor:
             cursor.execute(
                 """
                 insert into meta.pipeline_runs (run_id, stage, status, config)
-                values (gen_random_uuid(), 'llm.enrich', 'succeeded', '{}'::jsonb)
+                values (gen_random_uuid(), 'definitions.generate', 'succeeded', '{}'::jsonb)
                 returning run_id
                 """
             )
@@ -460,7 +509,8 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
             record={
                 "entry_id": entry_id,
                 "model": "test-model",
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": DEFAULT_DEFINITION_LANGUAGE,
                 "input_hash": "hash",
                 "request_payload": {"entry": "payload"},
                 "response_payload": valid_payload(),
@@ -474,7 +524,7 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
             settings,
             source_table="curated.entries",
             target_table="llm.entry_enrichments",
-            prompt_version=PROMPT_VERSION,
+            prompt_bundle=prompt_bundle,
             model="test-model",
             recompute_existing=False,
             limit_entries=None,
@@ -487,6 +537,10 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
 def test_iter_curated_entries_recompute_existing_returns_entries(temp_database_url: str) -> None:
     # This case covers the explicit rebuild path for LLM output regeneration.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
         seed_curated_entry(conn)
@@ -496,7 +550,7 @@ def test_iter_curated_entries_recompute_existing_returns_entries(temp_database_u
             settings,
             source_table="curated.entries",
             target_table="llm.entry_enrichments",
-            prompt_version=PROMPT_VERSION,
+            prompt_bundle=prompt_bundle,
             model="test-model",
             recompute_existing=True,
             limit_entries=None,
@@ -509,11 +563,15 @@ def test_iter_curated_entries_recompute_existing_returns_entries(temp_database_u
 def test_persist_enrichment_success_stores_success_row(temp_database_url: str) -> None:
     # This case ensures successful generations are durably persisted for export.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn)
-        llm_stage.ensure_prompt_version(conn, prompt_version=PROMPT_VERSION, prompt_text="prompt", output_contract={"type": "object"})
-        run_id = start_run(conn, stage="llm.enrich")
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
+        run_id = start_run(conn, stage="definitions.generate")
         llm_stage.persist_enrichment_success(
             conn,
             target_table="llm.entry_enrichments",
@@ -521,7 +579,8 @@ def test_persist_enrichment_success_stores_success_row(temp_database_url: str) -
             record={
                 "entry_id": entry_id,
                 "model": "test-model",
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": DEFAULT_DEFINITION_LANGUAGE,
                 "input_hash": "hash",
                 "request_payload": {"entry": "payload"},
                 "response_payload": valid_payload(),
@@ -540,18 +599,23 @@ def test_persist_enrichment_success_stores_success_row(temp_database_url: str) -
 def test_persist_enrichment_failure_stores_error_row(temp_database_url: str) -> None:
     # This case ensures failed generations are visible for debugging and retries.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn)
-        llm_stage.ensure_prompt_version(conn, prompt_version=PROMPT_VERSION, prompt_text="prompt", output_contract={"type": "object"})
-        run_id = start_run(conn, stage="llm.enrich")
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
+        run_id = start_run(conn, stage="definitions.generate")
         llm_stage.persist_enrichment_failure(
             conn,
             target_table="llm.entry_enrichments",
             run_id=run_id,
             entry_id=entry_id,
             model="test-model",
-            prompt_version=PROMPT_VERSION,
+            prompt_version=prompt_bundle.resolved_prompt_version,
+            definition_language=DEFAULT_DEFINITION_LANGUAGE,
             input_hash="hash",
             request_payload={"entry": "payload"},
             retries=3,
@@ -586,6 +650,73 @@ def test_run_llm_enrich_stage_processes_curated_entries_with_fake_client(tmp_pat
     assert result.processed == 1
     assert result.succeeded == 1
     assert result.failed == 0
+
+
+def test_run_llm_enrich_stage_supports_non_default_definition_language(
+    tmp_path: Path,
+    temp_database_url: str,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("LLM_API=http://localhost:3888/v1\nLLM_KEY=EMPTY\nLLM_MODEL=test-model\n", encoding="utf-8")
+    settings = RuntimeSettings(database_url=temp_database_url)
+    client = FakeLLMClient(
+        [
+            json.dumps(
+                {
+                    "headword_summary": "Overall learner-facing summary.",
+                    "study_notes": ["Keep register in mind."],
+                    "etymology_note": "Short etymology note.",
+                    "pos_groups": [
+                        {
+                            "pos_group_id": build_pos_group_id(pos="noun", etymology_id=None),
+                            "pos": "noun",
+                            "summary": "Noun summary.",
+                            "usage_notes": None,
+                            "meanings": [
+                                {
+                                    "sense_id": "s1",
+                                    "short_gloss": "cat",
+                                    "learner_explanation": "A domestic feline animal.",
+                                    "usage_note": None,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        seed_curated_entry(conn)
+
+    result = llm_stage.run_llm_enrich_stage(
+        settings=settings,
+        env_file=str(env_file),
+        client=client,
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
+        max_workers=1,
+    )
+
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
+    )
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select definition_language_code, definition_language_name, prompt_version
+                from llm.entry_enrichments
+                """
+            )
+            stored_language_code, stored_language_name, stored_prompt_version = cursor.fetchone()
+
+    assert result.succeeded == 1
+    assert stored_language_code == "en"
+    assert stored_language_name == "English"
+    assert stored_prompt_version == prompt_bundle.resolved_prompt_version
 
 
 def test_run_llm_enrich_stage_records_failed_entries(tmp_path: Path, temp_database_url: str) -> None:

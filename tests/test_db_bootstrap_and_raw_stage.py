@@ -191,7 +191,7 @@ def test_run_raw_ingest_stage_loads_rows_and_reuses_existing_snapshot(
             cursor.execute("select count(*) from raw.wiktionary_entries")
             row_count = cursor.fetchone()[0]
             cursor.execute(
-                "select count(*) from meta.pipeline_runs where stage = 'wiktionary.raw_ingest'"
+                "select count(*) from meta.pipeline_runs where stage = 'source.ingest'"
             )
             run_count = cursor.fetchone()[0]
 

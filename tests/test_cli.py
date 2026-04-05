@@ -9,39 +9,41 @@ import pytest
 
 from open_dictionary import cli
 from open_dictionary.config.settings import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
+from open_dictionary.llm.prompt import PROMPT_VERSION, build_prompt_bundle
 
 
 @pytest.mark.parametrize(
     ("argv", "patches", "expected_command", "expected_checks"),
     [
         (
-            ["db-init"],
+            ["init-db"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "get_connection": None,
                 "apply_foundation": lambda conn: ["20260403_curated_lineage_v2"],
             },
-            "db-init",
+            "init-db",
             {"applied_versions": ["20260403_curated_lineage_v2"]},
         ),
         (
-            ["download", "--output", "data/raw/sample.jsonl.gz"],
+            ["fetch-snapshot", "--output", "data/raw/sample.jsonl.gz"],
             {
                 "download_wiktionary_dump": lambda output, **kwargs: Path(output),
             },
-            "download",
+            "fetch-snapshot",
             {"output_path": "data/raw/sample.jsonl.gz"},
         ),
         (
-            ["extract", "--input", "data/raw/sample.jsonl.gz", "--output", "data/raw/sample.jsonl"],
+            ["unpack-snapshot", "--input", "data/raw/sample.jsonl.gz", "--output", "data/raw/sample.jsonl"],
             {
                 "extract_wiktionary_dump": lambda input_path, output, **kwargs: Path(output),
             },
-            "extract",
+            "unpack-snapshot",
             {"output_path": "data/raw/sample.jsonl"},
         ),
         (
-            ["raw-ingest", "--archive-path", "fixtures/wiktionary/raw.jsonl"],
+            ["ingest-snapshot", "--archive-path", "fixtures/wiktionary/raw.jsonl"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "run_raw_ingest_stage": lambda **kwargs: SimpleNamespace(
@@ -54,11 +56,11 @@ from open_dictionary.config.settings import RuntimeSettings
                     snapshot_preexisting=False,
                 ),
             },
-            "raw-ingest",
+            "ingest-snapshot",
             {"rows_loaded": 1000},
         ),
         (
-            ["curated-build"],
+            ["assemble-entries"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "run_curated_build_stage": lambda **kwargs: SimpleNamespace(
@@ -69,11 +71,11 @@ from open_dictionary.config.settings import RuntimeSettings
                     triage_written=1,
                 ),
             },
-            "curated-build",
+            "assemble-entries",
             {"entries_written": 742},
         ),
         (
-            ["llm-enrich"],
+            ["generate-definitions"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "run_llm_enrich_stage": lambda **kwargs: SimpleNamespace(
@@ -83,11 +85,11 @@ from open_dictionary.config.settings import RuntimeSettings
                     failed=0,
                 ),
             },
-            "llm-enrich",
+            "generate-definitions",
             {"succeeded": 742},
         ),
         (
-            ["export-audit-jsonl", "--output", "data/export/audit.jsonl"],
+            ["export-audit", "--output", "data/export/audit.jsonl"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "run_export_audit_jsonl_stage": lambda **kwargs: SimpleNamespace(
@@ -97,11 +99,11 @@ from open_dictionary.config.settings import RuntimeSettings
                     output_sha256="audit-sha",
                 ),
             },
-            "export-audit-jsonl",
+            "export-audit",
             {"entry_count": 742},
         ),
         (
-            ["export-distribution-jsonl", "--output", "data/export/distribution.jsonl"],
+            ["export-distribution", "--output", "data/export/distribution.jsonl"],
             {
                 "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
                 "run_export_distribution_jsonl_stage": lambda **kwargs: SimpleNamespace(
@@ -111,7 +113,7 @@ from open_dictionary.config.settings import RuntimeSettings
                     output_sha256="dist-sha",
                 ),
             },
-            "export-distribution-jsonl",
+            "export-distribution",
             {"entry_count": 741},
         ),
     ],
@@ -152,10 +154,14 @@ def test_pipeline_run_executes_stages_and_prints_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: dict[str, object] = {}
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
 
     def fake_raw(**kwargs):
-        calls["raw"] = kwargs
-        kwargs["progress_callback"]({"stage": "wiktionary.raw_ingest", "event": "acquire_complete", "rows_loaded": 0})
+        calls["source"] = kwargs
+        kwargs["progress_callback"]({"stage": "source.ingest", "event": "acquire_complete", "rows_loaded": 0})
         return SimpleNamespace(
             run_id=uuid4(),
             snapshot_id=uuid4(),
@@ -166,8 +172,8 @@ def test_pipeline_run_executes_stages_and_prints_summary(
         )
 
     def fake_curated(**kwargs):
-        calls["curated"] = kwargs
-        kwargs["progress_callback"]({"stage": "curated.build", "event": "build_progress", "groups_processed": 10})
+        calls["entries"] = kwargs
+        kwargs["progress_callback"]({"stage": "entries.assemble", "event": "build_progress", "groups_processed": 10})
         return SimpleNamespace(
             run_id=uuid4(),
             groups_processed=742,
@@ -177,8 +183,8 @@ def test_pipeline_run_executes_stages_and_prints_summary(
         )
 
     def fake_llm(**kwargs):
-        calls["llm"] = kwargs
-        kwargs["progress_callback"]({"stage": "llm.enrich", "event": "enrich_progress", "processed": 10})
+        calls["definitions"] = kwargs
+        kwargs["progress_callback"]({"stage": "definitions.generate", "event": "generate_progress", "processed": 10})
         return SimpleNamespace(
             run_id=uuid4(),
             processed=742,
@@ -188,7 +194,7 @@ def test_pipeline_run_executes_stages_and_prints_summary(
 
     def fake_distribution(**kwargs):
         calls["distribution"] = kwargs
-        kwargs["progress_callback"]({"stage": "export.distribution_jsonl", "event": "export_progress", "processed_entries": 10})
+        kwargs["progress_callback"]({"stage": "distribution.export", "event": "export_progress", "processed_entries": 10})
         return SimpleNamespace(
             run_id=uuid4(),
             entry_count=741,
@@ -225,8 +231,8 @@ def test_pipeline_run_executes_stages_and_prints_summary(
 
     exit_code = cli.main(
         [
-            "pipeline-run",
-            "--skip-db-init",
+            "run",
+            "--skip-init-db",
             "--archive-path",
             "fixtures/wiktionary/raw.jsonl",
             "--max-workers",
@@ -236,28 +242,33 @@ def test_pipeline_run_executes_stages_and_prints_summary(
             "data/export/distribution.jsonl",
             "--audit-output",
             "data/export/audit.jsonl",
-            "--llm-env-file",
+            "--model-env-file",
             "/tmp/llm.env",
         ]
     )
 
     assert exit_code == 0
-    assert calls["raw"]["archive_path"] == Path("fixtures/wiktionary/raw.jsonl")
-    assert calls["llm"]["max_workers"] == 50
-    assert calls["llm"]["env_file"] == "/tmp/llm.env"
+    assert calls["source"]["archive_path"] == Path("fixtures/wiktionary/raw.jsonl")
+    assert calls["definitions"]["max_workers"] == 50
+    assert calls["definitions"]["env_file"] == "/tmp/llm.env"
+    assert calls["definitions"]["definition_language"] == DEFAULT_DEFINITION_LANGUAGE
     assert calls["distribution"]["output_path"] == Path("data/export/distribution.jsonl")
+    assert calls["distribution"]["definition_language"] == DEFAULT_DEFINITION_LANGUAGE
     assert calls["audit"]["output_path"] == Path("data/export/audit.jsonl")
 
     captured = capsys.readouterr()
     summary = json.loads(captured.out)
-    assert summary["command"] == "pipeline-run"
+    assert summary["command"] == "run"
     assert summary["status"] == "succeeded"
-    assert summary["llm"]["failed"] == 0
+    assert summary["definitions"]["failed"] == 0
+    assert summary["definitions"]["prompt_version"] == prompt_bundle.resolved_prompt_version
+    assert summary["definitions"]["definition_language"]["code"] == DEFAULT_DEFINITION_LANGUAGE.code
     assert summary["distribution_export"]["entry_count"] == 741
     assert summary["distribution_export"]["validated_entry_count"] == 741
+    assert summary["distribution_export"]["prompt_version"] == prompt_bundle.resolved_prompt_version
     assert summary["audit_export"]["entry_count"] == 742
-    assert "[progress] stage=wiktionary.raw_ingest event=acquire_complete" in captured.err
-    assert "[progress] stage=llm.enrich event=enrich_progress" in captured.err
+    assert "[progress] stage=source.ingest event=acquire_complete" in captured.err
+    assert "[progress] stage=definitions.generate event=generate_progress" in captured.err
 
 
 def test_pipeline_run_stops_when_llm_has_failures(
@@ -308,8 +319,8 @@ def test_pipeline_run_stops_when_llm_has_failures(
     with pytest.raises(SystemExit):
         cli.main(
             [
-                "pipeline-run",
-                "--skip-db-init",
+                "run",
+                "--skip-init-db",
                 "--archive-path",
                 "fixtures/wiktionary/raw.jsonl",
             ]
@@ -378,8 +389,8 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
 
     exit_code = cli.main(
         [
-            "pipeline-run",
-            "--skip-db-init",
+            "run",
+            "--skip-init-db",
             "--archive-path",
             "fixtures/wiktionary/raw.jsonl",
             "--worker-tiers",
@@ -392,11 +403,11 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
     assert exit_code == 0
     assert calls == [50, 12]
     summary = json.loads(capsys.readouterr().out)
-    assert summary["command"] == "pipeline-run"
+    assert summary["command"] == "run"
     assert summary["status"] == "succeeded"
-    assert summary["llm"]["attempts"][0]["workers"] == 50
-    assert summary["llm"]["attempts"][1]["workers"] == 12
-    assert summary["llm"]["attempts"][1]["remaining_entries"] == 0
+    assert summary["definitions"]["attempts"][0]["workers"] == 50
+    assert summary["definitions"]["attempts"][1]["workers"] == 12
+    assert summary["definitions"]["attempts"][1]["remaining_entries"] == 0
 
 
 def test_validate_distribution_jsonl_command_reads_file(
@@ -412,9 +423,9 @@ def test_validate_distribution_jsonl_command_reads_file(
                 "headword": "barra",
                 "normalized_headword": "barra",
                 "headword_language": {"code": "aa", "name": "Afar"},
-                "definition_language": {"code": "zh-Hans", "name": "Chinese (Simplified)"},
+                "definition_language": {"code": "en", "name": "English"},
                 "entry_type": "standard",
-                "headword_summary": "整体说明。",
+                "headword_summary": "Overall summary.",
                 "study_notes": [],
                 "etymology_note": None,
                 "etymologies": [{"etymology_id": "et1", "text": None, "pos_members": ["noun"]}],
@@ -423,15 +434,15 @@ def test_validate_distribution_jsonl_command_reads_file(
                         "pos_group_id": "noun|et1",
                         "pos": "noun",
                         "etymology_id": "et1",
-                        "summary": "词性说明。",
+                        "summary": "Noun summary.",
                         "usage_notes": None,
                         "forms": [],
                         "pronunciations": [{"ipa": "/x/", "text": None, "audio_url": None, "tags": []}],
                         "meanings": [
                             {
                                 "meaning_id": "s1",
-                                "short_gloss": "女人",
-                                "learner_explanation": "详细解释。",
+                                "short_gloss": "woman",
+                                "learner_explanation": "Detailed explanation.",
                                 "usage_note": None,
                                 "labels": [],
                                 "topics": [],
@@ -449,13 +460,54 @@ def test_validate_distribution_jsonl_command_reads_file(
         encoding="utf-8",
     )
 
-    exit_code = cli.main(["validate-distribution-jsonl", "--input", str(output_path)])
+    exit_code = cli.main(["validate-distribution", "--input", str(output_path)])
 
     assert exit_code == 0
     captured = capsys.readouterr()
     summary = json.loads(captured.out)
-    assert summary["command"] == "validate-distribution-jsonl"
+    assert summary["command"] == "validate-distribution"
     assert summary["status"] == "succeeded"
     assert summary["entry_count"] == 1
-    assert "[progress] stage=export.distribution_jsonl.validate event=validate_start" in captured.err
-    assert "[progress] stage=export.distribution_jsonl.validate event=validate_complete" in captured.err
+    assert "[progress] stage=distribution.validate event=validate_start" in captured.err
+    assert "[progress] stage=distribution.validate event=validate_complete" in captured.err
+
+
+def test_llm_enrich_cli_accepts_custom_definition_language(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_run_llm_enrich_stage(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            run_id=uuid4(),
+            processed=1,
+            succeeded=1,
+            failed=0,
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
+    )
+    monkeypatch.setattr(cli, "run_llm_enrich_stage", fake_run_llm_enrich_stage)
+
+    exit_code = cli.main(
+        [
+            "generate-definitions",
+            "--definition-language-code",
+            "fr",
+            "--definition-language-name",
+            "French",
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert captured_kwargs["definition_language"].code == "fr"
+    assert captured_kwargs["definition_language"].name == "French"
+    assert summary["definition_language"] == {"code": "fr", "name": "French"}
+    assert summary["prompt_version"].endswith("__deflang__fr")

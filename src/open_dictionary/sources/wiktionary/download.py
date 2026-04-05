@@ -36,7 +36,7 @@ def download_wiktionary_dump(
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "open-dictionary/raw-ingest"},
+        headers={"User-Agent": "opend/ingest-snapshot"},
     )
 
     downloaded = 0

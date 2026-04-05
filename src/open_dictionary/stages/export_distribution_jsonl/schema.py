@@ -21,7 +21,17 @@ def validate_distribution_document(document: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ValueError("Distribution document must be a JSON object")
 
-    forbidden_keys = {"curated", "llm", "source_summary", "raw_record_refs", "generation_metadata", "model", "prompt_version"}
+    forbidden_keys = {
+        "curated",
+        "llm",
+        "entries",
+        "definitions",
+        "source_summary",
+        "raw_record_refs",
+        "generation_metadata",
+        "model",
+        "prompt_version",
+    }
     present_forbidden = sorted(forbidden_keys & document.keys())
     if present_forbidden:
         raise ValueError(f"Distribution document contains forbidden keys: {present_forbidden}")
@@ -228,10 +238,10 @@ def validate_distribution_jsonl_file(
 ) -> DistributionJSONLValidationResult:
     output_path = Path(path)
     entry_count = 0
-    reporter = ThrottledProgressReporter(progress_callback, stage="export.distribution_jsonl.validate")
+    reporter = ThrottledProgressReporter(progress_callback, stage="distribution.validate")
     emit_progress(
         progress_callback,
-        stage="export.distribution_jsonl.validate",
+        stage="distribution.validate",
         event="validate_start",
         input_path=str(output_path),
     )
@@ -255,7 +265,7 @@ def validate_distribution_jsonl_file(
             )
     emit_progress(
         progress_callback,
-        stage="export.distribution_jsonl.validate",
+        stage="distribution.validate",
         event="validate_complete",
         input_path=str(output_path),
         validated_entries=entry_count,

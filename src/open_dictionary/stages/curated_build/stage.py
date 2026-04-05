@@ -14,7 +14,7 @@ from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter
 from .transform import CuratedBuildOutput, TriageItem, build_curated_entry
 
 
-CURATED_BUILD_STAGE = "curated.build"
+CURATED_BUILD_STAGE = "entries.assemble"
 DEFAULT_RAW_SOURCE_TABLE = "raw.wiktionary_entries"
 DEFAULT_CURATED_TABLE = "curated.entries"
 DEFAULT_RELATIONS_TABLE = "curated.entry_relations"

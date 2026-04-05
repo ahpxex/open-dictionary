@@ -5,12 +5,19 @@ from pathlib import Path
 from uuid import uuid4
 
 from open_dictionary.config.settings import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
-from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id
+from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id, build_prompt_bundle
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.export_distribution_jsonl.schema import validate_distribution_document
 from open_dictionary.stages.export_distribution_jsonl import stage as distribution_stage
+
+
+ENGLISH_DEFINITION_LANGUAGE = {
+    "code": "en",
+    "name": "English",
+}
 
 
 def seed_curated_entry(
@@ -24,7 +31,7 @@ def seed_curated_entry(
     etymology_groups: list[dict] | None = None,
 ) -> str:
     entry_id = str(uuid4())
-    run_id = start_run(conn, stage="curated.build")
+    run_id = start_run(conn, stage="entries.assemble")
     payload = {
         "entry_id": entry_id,
         "word": word,
@@ -149,25 +156,44 @@ def seed_llm_enrichment(
     payload: dict | None = None,
     model: str = "test-model",
     prompt_version: str = PROMPT_VERSION,
+    definition_language: dict | None = None,
     status: str = "succeeded",
 ) -> None:
-    run_id = start_run(conn, stage="llm.enrich")
+    definition_language = definition_language or DEFAULT_DEFINITION_LANGUAGE.as_dict()
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=prompt_version,
+        definition_language=definition_language,
+    )
+    run_id = start_run(conn, stage="definitions.generate")
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            insert into llm.prompt_versions (prompt_version, prompt_text, output_contract)
-            values (%s, %s, '{}'::jsonb)
+            insert into llm.prompt_versions (
+                prompt_version,
+                prompt_text,
+                output_contract,
+                definition_language_code,
+                definition_language_name,
+                prompt_bundle
+            )
+            values (%s, %s, '{}'::jsonb, %s, %s, %s::jsonb)
             on conflict (prompt_version) do nothing
             """,
-            (prompt_version, "prompt text"),
+            (
+                prompt_bundle.resolved_prompt_version,
+                "prompt text",
+                definition_language["code"],
+                definition_language["name"],
+                json.dumps(prompt_bundle.as_metadata()),
+            ),
         )
         cursor.execute(
             """
             insert into llm.entry_enrichments (
-                run_id, entry_id, model, prompt_version, input_hash, status,
+                run_id, entry_id, model, prompt_version, definition_language_code, definition_language_name, input_hash, status,
                 request_payload, response_payload, raw_response, error, retries
             ) values (
-                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 '{}'::jsonb, %s, %s, null, 0
             )
             """,
@@ -175,8 +201,10 @@ def seed_llm_enrichment(
                 run_id,
                 entry_id,
                 model,
-                prompt_version,
-                f"hash-{entry_id}-{prompt_version}",
+                prompt_bundle.resolved_prompt_version,
+                definition_language["code"],
+                definition_language["name"],
+                f"hash-{entry_id}-{prompt_bundle.resolved_prompt_version}",
                 status,
                 json.dumps(payload or {}),
                 json.dumps(payload or {}),
@@ -247,13 +275,14 @@ def test_build_distribution_document_merges_curated_and_llm_fields() -> None:
     document = distribution_stage.build_distribution_document(
         curated_payload=curated_payload,
         llm_payload=llm_payload,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
     )
 
     assert document["schema_version"] == "distribution_entry_v1"
     assert document["headword"] == "sophisticated"
     assert document["definition_language"]["code"] == "zh-Hans"
-    assert "curated" not in document
-    assert "llm" not in document
+    assert "entries" not in document
+    assert "definitions" not in document
     assert document["pos_groups"][0]["meanings"][0]["learner_explanation"] == "这里是详细的中文自然语言解释。"
     assert validate_distribution_document(document) == document
 
@@ -318,8 +347,10 @@ def test_build_distribution_document_distinguishes_same_pos_across_etymologies()
     document = distribution_stage.build_distribution_document(
         curated_payload=curated_payload,
         llm_payload=llm_payload,
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
     )
 
+    assert document["definition_language"]["code"] == "en"
     assert document["pos_groups"][0]["summary"] == "河岸义项说明。"
     assert document["pos_groups"][1]["summary"] == "金融机构义项说明。"
 
@@ -368,10 +399,10 @@ def test_run_export_distribution_jsonl_stage_writes_output_and_manifest(
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "select artifact_type, metadata->>'schema_version', metadata->'curated_run_ids', metadata->'llm_run_ids' from export.artifacts where run_id = %s",
+                "select artifact_type, metadata->>'schema_version', metadata->'curated_run_ids', metadata->'definition_run_ids' from export.artifacts where run_id = %s",
                 (result.run_id,),
             )
-            artifact_type, schema_version, curated_run_ids, llm_run_ids = cursor.fetchone()
+            artifact_type, schema_version, curated_run_ids, definition_run_ids = cursor.fetchone()
 
     rows = read_jsonl(output)
 
@@ -381,4 +412,80 @@ def test_run_export_distribution_jsonl_stage_writes_output_and_manifest(
     assert artifact_type == "distribution_jsonl"
     assert schema_version == "distribution_entry_v1"
     assert curated_run_ids
-    assert llm_run_ids
+    assert definition_run_ids
+
+
+def test_run_export_distribution_jsonl_stage_selects_requested_definition_language(
+    temp_database_url: str,
+    tmp_path: Path,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+    output = tmp_path / "distribution-en.jsonl"
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        entry_id = seed_curated_entry(conn)
+        seed_llm_enrichment(
+            conn,
+            entry_id=entry_id,
+            definition_language=DEFAULT_DEFINITION_LANGUAGE.as_dict(),
+            payload={
+                "headword_summary": "中文整体说明。",
+                "study_notes": [],
+                "etymology_note": None,
+                "pos_groups": [
+                    {
+                        "pos_group_id": build_pos_group_id(pos="adj", etymology_id="et1"),
+                        "pos": "adj",
+                        "summary": "中文词性说明。",
+                        "usage_notes": None,
+                        "meanings": [
+                            {
+                                "sense_id": "s1",
+                                "short_gloss": "复杂",
+                                "learner_explanation": "中文解释。",
+                                "usage_note": None,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        seed_llm_enrichment(
+            conn,
+            entry_id=entry_id,
+            definition_language=ENGLISH_DEFINITION_LANGUAGE,
+            payload={
+                "headword_summary": "English overall summary.",
+                "study_notes": ["English study note."],
+                "etymology_note": None,
+                "pos_groups": [
+                    {
+                        "pos_group_id": build_pos_group_id(pos="adj", etymology_id="et1"),
+                        "pos": "adj",
+                        "summary": "English adjective summary.",
+                        "usage_notes": None,
+                        "meanings": [
+                            {
+                                "sense_id": "s1",
+                                "short_gloss": "refined",
+                                "learner_explanation": "Detailed English explanation.",
+                                "usage_note": None,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        conn.commit()
+
+    result = distribution_stage.run_export_distribution_jsonl_stage(
+        settings=settings,
+        output_path=output,
+        definition_language=ENGLISH_DEFINITION_LANGUAGE,
+    )
+
+    rows = read_jsonl(output)
+
+    assert result.entry_count == 1
+    assert rows[0]["definition_language"]["code"] == "en"
+    assert rows[0]["headword_summary"] == "English overall summary."

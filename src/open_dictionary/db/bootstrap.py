@@ -282,6 +282,50 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             """,
         ),
     ),
+    Migration(
+        version="20260404_multilingual_definition_language_v3",
+        statements=(
+            """
+            ALTER TABLE llm.prompt_versions
+            ADD COLUMN IF NOT EXISTS definition_language_code TEXT NOT NULL DEFAULT 'zh-Hans'
+            """,
+            """
+            ALTER TABLE llm.prompt_versions
+            ADD COLUMN IF NOT EXISTS definition_language_name TEXT NOT NULL DEFAULT 'Chinese (Simplified)'
+            """,
+            """
+            ALTER TABLE llm.prompt_versions
+            ADD COLUMN IF NOT EXISTS prompt_bundle JSONB NOT NULL DEFAULT '{}'::jsonb
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS llm_prompt_versions_definition_language_code_idx
+            ON llm.prompt_versions (definition_language_code)
+            """,
+            """
+            ALTER TABLE llm.entry_enrichments
+            ADD COLUMN IF NOT EXISTS definition_language_code TEXT NOT NULL DEFAULT 'zh-Hans'
+            """,
+            """
+            ALTER TABLE llm.entry_enrichments
+            ADD COLUMN IF NOT EXISTS definition_language_name TEXT NOT NULL DEFAULT 'Chinese (Simplified)'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS llm_entry_enrichments_definition_language_code_idx
+            ON llm.entry_enrichments (definition_language_code)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS llm_entry_enrichments_lookup_idx
+            ON llm.entry_enrichments (
+                entry_id,
+                model,
+                prompt_version,
+                definition_language_code,
+                status,
+                created_at DESC
+            )
+            """,
+        ),
+    ),
 )
 
 

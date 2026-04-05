@@ -7,10 +7,18 @@ from uuid import uuid4
 import pytest
 
 from open_dictionary.config.settings import RuntimeSettings
+from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
+from open_dictionary.llm.prompt import build_prompt_bundle
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.export_jsonl import stage as export_stage
+
+
+ENGLISH_DEFINITION_LANGUAGE = {
+    "code": "en",
+    "name": "English",
+}
 
 
 def seed_curated_entry(
@@ -21,7 +29,7 @@ def seed_curated_entry(
     lang_code: str = "en",
 ) -> str:
     entry_id = str(uuid4())
-    run_id = start_run(conn, stage="curated.build")
+    run_id = start_run(conn, stage="entries.assemble")
     payload = {
         "entry_id": entry_id,
         "word": word,
@@ -56,27 +64,42 @@ def seed_llm_enrichment(
     entry_id: str,
     model: str = "test-model",
     prompt_version: str = "prompt-v1",
+    definition_language: dict | None = None,
     created_offset: int = 0,
     payload: dict | None = None,
     status: str = "succeeded",
 ) -> None:
-    run_id = start_run(conn, stage="llm.enrich")
+    definition_language = definition_language or DEFAULT_DEFINITION_LANGUAGE.as_dict()
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=prompt_version,
+        definition_language=definition_language,
+    )
+    run_id = start_run(conn, stage="definitions.generate")
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            insert into llm.prompt_versions (prompt_version, prompt_text, output_contract)
-            values (%s, %s, '{}'::jsonb)
+            insert into llm.prompt_versions (
+                prompt_version, prompt_text, output_contract,
+                definition_language_code, definition_language_name, prompt_bundle
+            )
+            values (%s, %s, '{}'::jsonb, %s, %s, %s::jsonb)
             on conflict (prompt_version) do nothing
             """,
-            (prompt_version, "prompt text"),
+            (
+                prompt_bundle.resolved_prompt_version,
+                "prompt text",
+                definition_language["code"],
+                definition_language["name"],
+                json.dumps(prompt_bundle.as_metadata()),
+            ),
         )
         cursor.execute(
             """
             insert into llm.entry_enrichments (
-                run_id, entry_id, model, prompt_version, input_hash, status,
+                run_id, entry_id, model, prompt_version, definition_language_code, definition_language_name, input_hash, status,
                 request_payload, response_payload, raw_response, error, retries, created_at, updated_at
             ) values (
-                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 '{}'::jsonb, %s, %s, null, 0,
                 now() + (%s || ' seconds')::interval,
                 now() + (%s || ' seconds')::interval
@@ -86,8 +109,10 @@ def seed_llm_enrichment(
                 run_id,
                 entry_id,
                 model,
-                prompt_version,
-                f"hash-{entry_id}-{model}-{prompt_version}-{created_offset}",
+                prompt_bundle.resolved_prompt_version,
+                definition_language["code"],
+                definition_language["name"],
+                f"hash-{entry_id}-{model}-{prompt_bundle.resolved_prompt_version}-{created_offset}",
                 status,
                 json.dumps(payload or {"headword_summary": "headword summary"}),
                 json.dumps(payload or {"headword_summary": "headword summary"}),
@@ -141,13 +166,14 @@ def test_iter_export_documents_includes_llm_payload_when_present(temp_database_u
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))
 
     assert len(docs) == 1
-    assert docs[0]["llm"] is not None
-    assert docs[0]["curated"]["word"] == "cat"
+    assert docs[0]["definitions"] is not None
+    assert docs[0]["entries"]["word"] == "cat"
 
 
 def test_iter_export_documents_can_include_unenriched_entries(temp_database_url: str) -> None:
@@ -163,12 +189,13 @@ def test_iter_export_documents_can_include_unenriched_entries(temp_database_url:
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))
 
     assert len(docs) == 1
-    assert docs[0]["llm"] is None
+    assert docs[0]["definitions"] is None
 
 
 def test_iter_export_documents_can_exclude_unenriched_entries(temp_database_url: str) -> None:
@@ -184,7 +211,8 @@ def test_iter_export_documents_can_exclude_unenriched_entries(temp_database_url:
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=False,
     ))
 
@@ -206,16 +234,21 @@ def test_iter_export_documents_filters_by_model(temp_database_url: str) -> None:
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model="model-b",
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=False,
     ))
 
-    assert docs[0]["llm"]["model"] == "model-b"
+    assert docs[0]["definitions"]["model"] == "model-b"
 
 
 def test_iter_export_documents_filters_by_prompt_version(temp_database_url: str) -> None:
     # This case keeps prompt-versioned exports reproducible.
     settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version="prompt-b",
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn, word="cat")
@@ -228,11 +261,47 @@ def test_iter_export_documents_filters_by_prompt_version(temp_database_url: str)
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version="prompt-b",
+        prompt_bundle=prompt_bundle,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=False,
     ))
 
-    assert docs[0]["llm"]["prompt_version"] == "prompt-b"
+    assert docs[0]["definitions"]["prompt_version"] == prompt_bundle.resolved_prompt_version
+
+
+def test_iter_export_documents_filters_by_definition_language(temp_database_url: str) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        entry_id = seed_curated_entry(conn, word="cat")
+        seed_llm_enrichment(
+            conn,
+            entry_id=entry_id,
+            definition_language=DEFAULT_DEFINITION_LANGUAGE.as_dict(),
+            payload={"headword_summary": "中文摘要"},
+        )
+        seed_llm_enrichment(
+            conn,
+            entry_id=entry_id,
+            definition_language=ENGLISH_DEFINITION_LANGUAGE,
+            payload={"headword_summary": "English summary"},
+        )
+        conn.commit()
+
+    docs = list(
+        export_stage.iter_export_documents(
+            settings=settings,
+            curated_table="curated.entries",
+            llm_table="llm.entry_enrichments",
+            model=None,
+            prompt_bundle=None,
+            definition_language=ENGLISH_DEFINITION_LANGUAGE,
+            include_unenriched=False,
+        )
+    )
+
+    assert docs[0]["definitions"]["definition_language"]["code"] == "en"
+    assert docs[0]["definitions"]["payload"]["headword_summary"] == "English summary"
 
 
 def test_iter_export_documents_selects_latest_successful_enrichment(temp_database_url: str) -> None:
@@ -250,11 +319,12 @@ def test_iter_export_documents_selects_latest_successful_enrichment(temp_databas
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=False,
     ))
 
-    assert docs[0]["llm"]["payload"]["headword_summary"] == "new"
+    assert docs[0]["definitions"]["payload"]["headword_summary"] == "new"
 
 
 def test_iter_export_documents_ignores_failed_enrichments(temp_database_url: str) -> None:
@@ -271,11 +341,12 @@ def test_iter_export_documents_ignores_failed_enrichments(temp_database_url: str
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))
 
-    assert docs[0]["llm"] is None
+    assert docs[0]["definitions"] is None
 
 
 def test_iter_export_documents_orders_by_lang_and_normalized_word(temp_database_url: str) -> None:
@@ -293,7 +364,8 @@ def test_iter_export_documents_orders_by_lang_and_normalized_word(temp_database_
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))
 
@@ -309,7 +381,7 @@ def test_record_export_artifact_persists_metadata(temp_database_url: str, tmp_pa
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
-        run_id = start_run(conn, stage="export.audit_jsonl")
+        run_id = start_run(conn, stage="audit.export")
         export_stage.record_export_artifact(
             conn,
             artifact_table="export.artifacts",
@@ -344,16 +416,16 @@ def test_run_export_jsonl_stage_writes_output_and_manifest(temp_database_url: st
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "select metadata->'curated_run_ids', metadata->'llm_run_ids' from export.artifacts where run_id = %s",
+                "select metadata->'curated_run_ids', metadata->'definition_run_ids' from export.artifacts where run_id = %s",
                 (result.run_id,),
             )
-            curated_run_ids, llm_run_ids = cursor.fetchone()
+            curated_run_ids, definition_run_ids = cursor.fetchone()
 
     assert result.entry_count == 1
     assert output.exists()
     assert read_jsonl(output)[0]["word"] == "cat"
     assert curated_run_ids
-    assert llm_run_ids
+    assert definition_run_ids
 
 
 def test_run_export_jsonl_stage_can_emit_only_enriched_entries(temp_database_url: str, tmp_path: Path) -> None:
@@ -415,7 +487,7 @@ def test_run_export_jsonl_stage_marks_run_failed_when_write_crashes(
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "select status, error from meta.pipeline_runs where stage = 'export.audit_jsonl' order by started_at desc limit 1"
+                "select status, error from meta.pipeline_runs where stage = 'audit.export' order by started_at desc limit 1"
             )
             status, error = cursor.fetchone()
 
@@ -457,11 +529,12 @@ def test_export_document_contains_expected_top_level_keys(temp_database_url: str
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))[0]
 
-    assert set(document.keys()) == {"entry_id", "lang_code", "normalized_word", "word", "curated", "llm"}
+    assert set(document.keys()) == {"entry_id", "lang_code", "normalized_word", "word", "entries", "definitions"}
 
 
 def test_export_document_uses_null_llm_when_missing(temp_database_url: str) -> None:
@@ -477,11 +550,12 @@ def test_export_document_uses_null_llm_when_missing(temp_database_url: str) -> N
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))[0]
 
-    assert document["llm"] is None
+    assert document["definitions"] is None
 
 
 def test_export_document_embeds_curated_payload_verbatim(temp_database_url: str) -> None:
@@ -497,12 +571,13 @@ def test_export_document_embeds_curated_payload_verbatim(temp_database_url: str)
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))[0]
 
-    assert document["curated"]["word"] == "cat"
-    assert document["curated"]["normalized_word"] == "cat"
+    assert document["entries"]["word"] == "cat"
+    assert document["entries"]["normalized_word"] == "cat"
 
 
 def test_write_jsonl_atomic_produces_one_line_per_document(tmp_path: Path) -> None:
@@ -524,7 +599,8 @@ def test_iter_export_documents_returns_empty_when_no_curated_rows_exist(temp_dat
         curated_table="curated.entries",
         llm_table="llm.entry_enrichments",
         model=None,
-        prompt_version=None,
+        prompt_bundle=None,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
         include_unenriched=True,
     ))
 
@@ -536,7 +612,7 @@ def test_record_export_artifact_tracks_entry_count(temp_database_url: str, tmp_p
     settings = RuntimeSettings(database_url=temp_database_url)
     with get_connection(settings) as conn:
         apply_foundation(conn)
-        run_id = start_run(conn, stage="export.audit_jsonl")
+        run_id = start_run(conn, stage="audit.export")
         export_stage.record_export_artifact(
             conn,
             artifact_table="export.artifacts",

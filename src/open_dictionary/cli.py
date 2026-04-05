@@ -11,9 +11,10 @@ import psycopg
 from psycopg import sql
 
 from .config import load_settings
+from .contracts import DEFAULT_DEFINITION_LANGUAGE, normalize_language_spec
 from .db.bootstrap import LATEST_FOUNDATION_VERSION, apply_foundation
 from .db.connection import get_connection
-from .llm.prompt import PROMPT_VERSION
+from .llm.prompt import PROMPT_VERSION, build_prompt_bundle
 from .sources.wiktionary import (
     DEFAULT_WIKTIONARY_SOURCE_URL,
     download_wiktionary_dump,
@@ -48,6 +49,17 @@ def _add_database_options(parser: argparse.ArgumentParser) -> None:
         "--database-url-var",
         default="DATABASE_URL",
         help="Environment variable name holding the connection string.",
+    )
+
+
+def _add_definition_language_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--definition-language-code",
+        help=f"BCP 47-style language code for generated definitions (default: {DEFAULT_DEFINITION_LANGUAGE.code}).",
+    )
+    parser.add_argument(
+        "--definition-language-name",
+        help=f"Human-readable name for the definition language (default: {DEFAULT_DEFINITION_LANGUAGE.name}).",
     )
 
 
@@ -99,12 +111,32 @@ def _identifier_from_dotted(qualified_name: str) -> sql.Identifier:
     return sql.Identifier(*parts)
 
 
+def _get_definition_language(args: argparse.Namespace):
+    code = getattr(args, "definition_language_code", None)
+    name = getattr(args, "definition_language_name", None)
+    if (code is None) != (name is None):
+        args._parser.error(
+            "Provide both --definition-language-code and --definition-language-name together, "
+            "or omit both to use the default definition language."
+        )
+    try:
+        return normalize_language_spec(
+            {
+                "code": code or DEFAULT_DEFINITION_LANGUAGE.code,
+                "name": name or DEFAULT_DEFINITION_LANGUAGE.name,
+            }
+        )
+    except ValueError as exc:
+        args._parser.error(str(exc))
+
+
 def _count_pending_llm_entries(
     settings,
     *,
     source_table: str,
     target_table: str,
     prompt_version: str,
+    definition_language_code: str,
     model: str | None,
     recompute_existing: bool,
 ) -> int:
@@ -123,6 +155,7 @@ def _count_pending_llm_entries(
             FROM {target_table} AS x
             WHERE x.entry_id = e.entry_id
               AND x.prompt_version = %s
+              AND x.definition_language_code = %s
               AND x.status = 'succeeded'
               {model_filter}
         )
@@ -132,7 +165,7 @@ def _count_pending_llm_entries(
         target_table=_identifier_from_dotted(target_table),
         model_filter=sql.SQL("AND x.model = %s") if model is not None else sql.SQL(""),
     )
-    params: list[object] = [prompt_version]
+    params: list[object] = [prompt_version, definition_language_code]
     if model is not None:
         params.append(model)
     with get_connection(settings) as conn:
@@ -146,6 +179,7 @@ def _fetch_recent_failed_enrichments(
     *,
     target_table: str,
     prompt_version: str,
+    definition_language_code: str,
     model: str | None,
     limit: int,
 ) -> list[tuple[str, str]]:
@@ -155,6 +189,7 @@ def _fetch_recent_failed_enrichments(
         FROM {target_table}
         WHERE status = 'failed'
           AND prompt_version = %s
+          AND definition_language_code = %s
           {model_filter}
         ORDER BY enrichment_id DESC
         LIMIT %s
@@ -163,7 +198,7 @@ def _fetch_recent_failed_enrichments(
         target_table=_identifier_from_dotted(target_table),
         model_filter=sql.SQL("AND model = %s") if model is not None else sql.SQL(""),
     )
-    params: list[object] = [prompt_version]
+    params: list[object] = [prompt_version, definition_language_code]
     if model is not None:
         params.append(model)
     params.append(limit)
@@ -186,7 +221,7 @@ def _cmd_download(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     _print_command_result(
-        "download",
+        "fetch-snapshot",
         output_path=str(destination),
         source_url=args.url,
     )
@@ -200,7 +235,7 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
         applied_versions = apply_foundation(conn)
 
     _print_command_result(
-        "db-init",
+        "init-db",
         latest_foundation_version=LATEST_FOUNDATION_VERSION,
         applied_versions=applied_versions,
         already_current=not applied_versions,
@@ -228,7 +263,7 @@ def _cmd_curated_build(args: argparse.Namespace) -> int:
         args._parser.error(f"Database error: {exc}")
 
     _print_command_result(
-        "curated-build",
+        "assemble-entries",
         stage=CURATED_BUILD_STAGE,
         run_id=str(result.run_id),
         groups_processed=result.groups_processed,
@@ -242,14 +277,21 @@ def _cmd_curated_build(args: argparse.Namespace) -> int:
 def _cmd_llm_enrich(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
     progress_callback = _make_progress_callback()
+    definition_language = _get_definition_language(args)
+    model_env_file = args.model_env_file or args.env_file
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=args.prompt_version,
+        definition_language=definition_language,
+    )
 
     try:
         result = run_llm_enrich_stage(
             settings=settings,
-            env_file=args.env_file,
+            env_file=model_env_file,
             source_table=args.source_table,
             target_table=args.target_table,
             prompt_version=args.prompt_version,
+            definition_language=definition_language,
             limit_entries=args.limit_entries,
             max_workers=args.max_workers,
             max_retries=args.max_retries,
@@ -260,13 +302,15 @@ def _cmd_llm_enrich(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     _print_command_result(
-        "llm-enrich",
+        "generate-definitions",
         stage=LLM_ENRICH_STAGE,
         run_id=str(result.run_id),
         processed=result.processed,
         succeeded=result.succeeded,
         failed=result.failed,
-        prompt_version=args.prompt_version,
+        prompt_template_version=args.prompt_version,
+        prompt_version=prompt_bundle.resolved_prompt_version,
+        definition_language=definition_language.as_dict(),
         max_workers=args.max_workers,
     )
     return 0
@@ -275,6 +319,15 @@ def _cmd_llm_enrich(args: argparse.Namespace) -> int:
 def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
     progress_callback = _make_progress_callback()
+    definition_language = _get_definition_language(args)
+    prompt_bundle = (
+        build_prompt_bundle(
+            prompt_version=args.prompt_version,
+            definition_language=definition_language,
+        )
+        if args.prompt_version is not None
+        else None
+    )
 
     try:
         result = run_export_audit_jsonl_stage(
@@ -285,26 +338,23 @@ def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
             artifact_table=args.artifact_table,
             model=args.model,
             prompt_version=args.prompt_version,
+            definition_language=definition_language,
             include_unenriched=args.include_unenriched,
             progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
 
-    if getattr(args, "command", None) == "export-jsonl":
-        print(
-            "Warning: export-jsonl is a deprecated alias. "
-            "Use export-audit-jsonl for the merged audit artifact.",
-            file=sys.stderr,
-        )
-
     _print_command_result(
-        "export-audit-jsonl" if getattr(args, "command", None) != "export-jsonl" else "export-jsonl",
+        "export-audit",
         stage=EXPORT_AUDIT_JSONL_STAGE,
         run_id=str(result.run_id),
         entry_count=result.entry_count,
         output_path=str(result.output_path),
         output_sha256=result.output_sha256,
+        prompt_template_version=args.prompt_version,
+        prompt_version=prompt_bundle.resolved_prompt_version if prompt_bundle is not None else None,
+        definition_language=definition_language.as_dict(),
     )
     return 0
 
@@ -312,6 +362,11 @@ def _cmd_export_audit_jsonl(args: argparse.Namespace) -> int:
 def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
     progress_callback = _make_progress_callback()
+    definition_language = _get_definition_language(args)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=args.prompt_version,
+        definition_language=definition_language,
+    )
 
     try:
         result = run_export_distribution_jsonl_stage(
@@ -322,31 +377,40 @@ def _cmd_export_distribution_jsonl(args: argparse.Namespace) -> int:
             artifact_table=args.artifact_table,
             model=args.model,
             prompt_version=args.prompt_version,
+            definition_language=definition_language,
             progress_callback=progress_callback,
         )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
         args._parser.error(str(exc))
 
     _print_command_result(
-        "export-distribution-jsonl",
+        "export-distribution",
         stage=EXPORT_DISTRIBUTION_JSONL_STAGE,
         schema_version=DISTRIBUTION_SCHEMA_VERSION,
         run_id=str(result.run_id),
         entry_count=result.entry_count,
         output_path=str(result.output_path),
         output_sha256=result.output_sha256,
+        prompt_template_version=args.prompt_version,
+        prompt_version=prompt_bundle.resolved_prompt_version,
+        definition_language=definition_language.as_dict(),
     )
     return 0
 
 
 def _cmd_pipeline_run(args: argparse.Namespace) -> int:
     settings = _get_settings(args)
-    llm_env_file = args.llm_env_file or args.env_file
+    model_env_file = args.model_env_file or args.env_file
     worker_tiers = args.worker_tiers or [args.max_workers]
     progress_callback = _make_progress_callback()
+    definition_language = _get_definition_language(args)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=args.prompt_version,
+        definition_language=definition_language,
+    )
 
     try:
-        if not args.skip_db_init:
+        if not args.skip_init_db:
             with get_connection(settings) as conn:
                 apply_foundation(conn)
 
@@ -381,10 +445,11 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         if args.limit_entries is not None:
             llm_result = run_llm_enrich_stage(
                 settings=settings,
-                env_file=llm_env_file,
+                env_file=model_env_file,
                 source_table=args.curated_table,
                 target_table=args.llm_table,
                 prompt_version=args.prompt_version,
+                definition_language=definition_language,
                 limit_entries=args.limit_entries,
                 max_workers=worker_tiers[0],
                 max_retries=args.max_retries,
@@ -402,7 +467,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             )
             if llm_result.failed:
                 raise RuntimeError(
-                    f"LLM enrichment left {llm_result.failed} failed entries in the limited run. "
+                    f"Definition generation left {llm_result.failed} failed entries in the limited run. "
                     "Resolve them or rerun with a safer concurrency before export."
                 )
         else:
@@ -410,7 +475,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 settings,
                 source_table=args.curated_table,
                 target_table=args.llm_table,
-                prompt_version=args.prompt_version,
+                prompt_version=prompt_bundle.resolved_prompt_version,
+                definition_language_code=definition_language.code,
                 model=args.model,
                 recompute_existing=args.recompute_existing,
             )
@@ -419,18 +485,20 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                     break
                 progress_callback(
                     {
-                        "stage": "pipeline.run",
-                        "event": "llm_attempt_start",
+                        "stage": "workflow.run",
+                        "event": "definitions_attempt_start",
                         "workers": workers,
                         "remaining_entries": remaining_entries,
+                        "definition_language_code": definition_language.code,
                     }
                 )
                 llm_result = run_llm_enrich_stage(
                     settings=settings,
-                    env_file=llm_env_file,
+                    env_file=model_env_file,
                     source_table=args.curated_table,
                     target_table=args.llm_table,
                     prompt_version=args.prompt_version,
+                    definition_language=definition_language,
                     limit_entries=None,
                     max_workers=workers,
                     max_retries=args.max_retries,
@@ -441,7 +509,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                     settings,
                     source_table=args.curated_table,
                     target_table=args.llm_table,
-                    prompt_version=args.prompt_version,
+                    prompt_version=prompt_bundle.resolved_prompt_version,
+                    definition_language_code=definition_language.code,
                     model=args.model,
                     recompute_existing=args.recompute_existing,
                 )
@@ -456,8 +525,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 )
                 progress_callback(
                     {
-                        "stage": "pipeline.run",
-                        "event": "llm_attempt_complete",
+                        "stage": "workflow.run",
+                        "event": "definitions_attempt_complete",
                         **llm_attempts[-1],
                     }
                 )
@@ -466,12 +535,13 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 failed_examples = _fetch_recent_failed_enrichments(
                     settings,
                     target_table=args.llm_table,
-                    prompt_version=args.prompt_version,
+                    prompt_version=prompt_bundle.resolved_prompt_version,
+                    definition_language_code=definition_language.code,
                     model=args.model,
                     limit=10,
                 )
                 raise RuntimeError(
-                    f"LLM enrichment still has {remaining_entries} unresolved entries after worker tiers {worker_tiers}. "
+                    f"Definition generation still has {remaining_entries} unresolved entries after worker tiers {worker_tiers}. "
                     f"Recent failed examples: {failed_examples}"
                 )
 
@@ -487,6 +557,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 artifact_table=args.artifact_table,
                 model=args.model,
                 prompt_version=args.prompt_version,
+                definition_language=definition_language,
                 progress_callback=progress_callback,
             )
             if args.validate_distribution:
@@ -509,6 +580,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 artifact_table=args.artifact_table,
                 model=args.model,
                 prompt_version=args.prompt_version,
+                definition_language=definition_language,
                 include_unenriched=args.include_unenriched_audit,
                 progress_callback=progress_callback,
             )
@@ -516,25 +588,27 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     summary = {
-        "db_initialized": not args.skip_db_init,
-        "raw": {
+        "db_initialized": not args.skip_init_db,
+        "source": {
             "run_id": str(raw_result.run_id),
             "snapshot_id": str(raw_result.snapshot_id),
             "rows_loaded": raw_result.rows_loaded,
             "anomalies_logged": raw_result.anomalies_logged,
         },
-        "curated": {
+        "entries": {
             "run_id": str(curated_result.run_id),
             "entries_written": curated_result.entries_written,
             "relations_written": curated_result.relations_written,
             "triage_written": curated_result.triage_written,
         },
-        "llm": {
+        "definitions": {
             "run_id": str(llm_result.run_id),
             "processed": llm_result.processed,
             "succeeded": llm_result.succeeded,
             "failed": llm_result.failed,
-            "prompt_version": args.prompt_version,
+            "prompt_template_version": args.prompt_version,
+            "prompt_version": prompt_bundle.resolved_prompt_version,
+            "definition_language": definition_language.as_dict(),
             "worker_tiers": worker_tiers,
             "attempts": llm_attempts,
         },
@@ -544,6 +618,9 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 "entry_count": distribution_result.entry_count,
                 "output_path": str(distribution_result.output_path),
                 "output_sha256": distribution_result.output_sha256,
+                "prompt_template_version": args.prompt_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": definition_language.as_dict(),
                 "validated_entry_count": (
                     distribution_validation.entry_count
                     if distribution_validation is not None
@@ -559,13 +636,20 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 "entry_count": audit_result.entry_count,
                 "output_path": str(audit_result.output_path),
                 "output_sha256": audit_result.output_sha256,
+                "prompt_template_version": args.prompt_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": definition_language.as_dict(),
             }
             if audit_result is not None
             else None
         ),
     }
-    _print_command_result("pipeline-run", **summary)
+    _print_command_result("run", **summary)
     return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    return _cmd_pipeline_run(args)
 
 
 def _cmd_validate_distribution_jsonl(args: argparse.Namespace) -> int:
@@ -578,7 +662,7 @@ def _cmd_validate_distribution_jsonl(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     _print_command_result(
-        "validate-distribution-jsonl",
+        "validate-distribution",
         schema_version=DISTRIBUTION_SCHEMA_VERSION,
         output_path=str(result.output_path),
         entry_count=result.entry_count,
@@ -599,7 +683,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         args._parser.error(str(exc))
 
     _print_command_result(
-        "extract",
+        "unpack-snapshot",
         input_path=str(args.input),
         output_path=str(output),
     )
@@ -632,7 +716,7 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
         args._parser.error(f"Database error: {exc}")
 
     _print_command_result(
-        "raw-ingest",
+        "ingest-snapshot",
         stage=RAW_INGEST_STAGE,
         run_id=str(result.run_id),
         snapshot_id=str(result.snapshot_id),
@@ -652,15 +736,15 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     db_init_parser = subparsers.add_parser(
-        "db-init",
+        "init-db",
         help="Apply the rewrite foundation schemas and tables.",
     )
     _add_database_options(db_init_parser)
     db_init_parser.set_defaults(func=_cmd_db_init, _parser=db_init_parser)
 
     curated_build_parser = subparsers.add_parser(
-        "curated-build",
-        help="Build curated word-centric entries from raw Wiktionary records.",
+        "assemble-entries",
+        help="Assemble word-centric learner entries from raw Wiktionary records.",
     )
     curated_build_parser.add_argument(
         "--source-table",
@@ -670,7 +754,7 @@ def _build_parser() -> argparse.ArgumentParser:
     curated_build_parser.add_argument(
         "--target-table",
         default=DEFAULT_CURATED_TABLE,
-        help="Target curated entries table (default: %(default)s).",
+        help="Target assembled-entries table (default: %(default)s).",
     )
     curated_build_parser.add_argument(
         "--relations-table",
@@ -701,18 +785,19 @@ def _build_parser() -> argparse.ArgumentParser:
     curated_build_parser.set_defaults(func=_cmd_curated_build, _parser=curated_build_parser)
 
     llm_enrich_parser = subparsers.add_parser(
-        "llm-enrich",
-        help="Generate structured enrichment payloads from curated entries.",
+        "generate-definitions",
+        help="Generate learner-facing definitions from assembled entries.",
     )
     llm_enrich_parser.add_argument(
         "--source-table",
         default="curated.entries",
-        help="Source curated entries table (default: %(default)s).",
+        help="Source assembled-entries table (default: %(default)s).",
     )
     llm_enrich_parser.add_argument(
-        "--target-table",
+        "--definitions-table",
         default="llm.entry_enrichments",
-        help="Target enrichment table (default: %(default)s).",
+        dest="target_table",
+        help="Target generated-definitions table (default: %(default)s).",
     )
     llm_enrich_parser.add_argument(
         "--prompt-version",
@@ -728,25 +813,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-workers",
         type=int,
         default=4,
-        help="Number of concurrent worker threads used for LLM calls (default: %(default)s).",
+        help="Number of concurrent worker threads used for model calls (default: %(default)s).",
     )
     llm_enrich_parser.add_argument(
         "--max-retries",
         type=int,
         default=3,
-        help="Maximum retries per entry before marking enrichment as failed (default: %(default)s).",
+        help="Maximum retries per entry before marking definition generation as failed (default: %(default)s).",
     )
     llm_enrich_parser.add_argument(
         "--recompute-existing",
         action="store_true",
-        help="Re-enrich entries even if a successful enrichment already exists.",
+        help="Regenerate definitions even if successful rows already exist.",
     )
+    llm_enrich_parser.add_argument(
+        "--model-env-file",
+        dest="model_env_file",
+        help="Optional env file for model credentials. Defaults to --env-file.",
+    )
+    _add_definition_language_options(llm_enrich_parser)
     _add_database_options(llm_enrich_parser)
     llm_enrich_parser.set_defaults(func=_cmd_llm_enrich, _parser=llm_enrich_parser)
 
     export_audit_jsonl_parser = subparsers.add_parser(
-        "export-audit-jsonl",
-        help="Export the current merged curated+LLM audit artifact as JSONL.",
+        "export-audit",
+        help="Export the current merged entries+definitions audit artifact as JSONL.",
     )
     export_audit_jsonl_parser.add_argument(
         "--output",
@@ -757,12 +848,13 @@ def _build_parser() -> argparse.ArgumentParser:
     export_audit_jsonl_parser.add_argument(
         "--curated-table",
         default="curated.entries",
-        help="Source curated entries table (default: %(default)s).",
+        help="Source assembled-entries table (default: %(default)s).",
     )
     export_audit_jsonl_parser.add_argument(
-        "--llm-table",
+        "--definitions-table",
         default="llm.entry_enrichments",
-        help="Source LLM enrichments table (default: %(default)s).",
+        dest="llm_table",
+        help="Source generated-definitions table (default: %(default)s).",
     )
     export_audit_jsonl_parser.add_argument(
         "--artifact-table",
@@ -771,69 +863,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_audit_jsonl_parser.add_argument(
         "--model",
-        help="Optional model filter when choosing the latest successful enrichment.",
+        help="Optional model filter when choosing the latest successful definition run.",
     )
     export_audit_jsonl_parser.add_argument(
         "--prompt-version",
-        help="Optional prompt version filter when choosing the latest successful enrichment.",
+        help="Optional prompt version filter when choosing the latest successful definition run.",
     )
     export_audit_jsonl_parser.add_argument(
         "--include-unenriched",
         action="store_true",
-        help="Include curated entries even when no successful enrichment exists.",
+        help="Include assembled entries even when no successful definition row exists.",
     )
+    _add_definition_language_options(export_audit_jsonl_parser)
     _add_database_options(export_audit_jsonl_parser)
     export_audit_jsonl_parser.set_defaults(
         func=_cmd_export_audit_jsonl,
         _parser=export_audit_jsonl_parser,
     )
 
-    export_jsonl_alias_parser = subparsers.add_parser(
-        "export-jsonl",
-        help="Deprecated alias for export-audit-jsonl.",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/export/audit.jsonl"),
-        help="Output JSONL path (default: %(default)s).",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--curated-table",
-        default="curated.entries",
-        help="Source curated entries table (default: %(default)s).",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--llm-table",
-        default="llm.entry_enrichments",
-        help="Source LLM enrichments table (default: %(default)s).",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--artifact-table",
-        default="export.artifacts",
-        help="Export artifact metadata table (default: %(default)s).",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--model",
-        help="Optional model filter when choosing the latest successful enrichment.",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--prompt-version",
-        help="Optional prompt version filter when choosing the latest successful enrichment.",
-    )
-    export_jsonl_alias_parser.add_argument(
-        "--include-unenriched",
-        action="store_true",
-        help="Include curated entries even when no successful enrichment exists.",
-    )
-    _add_database_options(export_jsonl_alias_parser)
-    export_jsonl_alias_parser.set_defaults(
-        func=_cmd_export_audit_jsonl,
-        _parser=export_jsonl_alias_parser,
-    )
-
     export_distribution_jsonl_parser = subparsers.add_parser(
-        "export-distribution-jsonl",
+        "export-distribution",
         help="Export the learner-facing distribution JSONL artifact.",
     )
     export_distribution_jsonl_parser.add_argument(
@@ -845,12 +894,13 @@ def _build_parser() -> argparse.ArgumentParser:
     export_distribution_jsonl_parser.add_argument(
         "--curated-table",
         default="curated.entries",
-        help="Source curated entries table (default: %(default)s).",
+        help="Source assembled-entries table (default: %(default)s).",
     )
     export_distribution_jsonl_parser.add_argument(
-        "--llm-table",
+        "--definitions-table",
         default="llm.entry_enrichments",
-        help="Source LLM enrichments table (default: %(default)s).",
+        dest="llm_table",
+        help="Source generated-definitions table (default: %(default)s).",
     )
     export_distribution_jsonl_parser.add_argument(
         "--artifact-table",
@@ -859,13 +909,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_distribution_jsonl_parser.add_argument(
         "--model",
-        help="Optional model filter when choosing the latest successful enrichment.",
+        help="Optional model filter when choosing the latest successful definition run.",
     )
     export_distribution_jsonl_parser.add_argument(
         "--prompt-version",
         default=PROMPT_VERSION,
         help="Prompt version required for distribution export (default: %(default)s).",
     )
+    _add_definition_language_options(export_distribution_jsonl_parser)
     _add_database_options(export_distribution_jsonl_parser)
     export_distribution_jsonl_parser.set_defaults(
         func=_cmd_export_distribution_jsonl,
@@ -873,7 +924,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     validate_distribution_jsonl_parser = subparsers.add_parser(
-        "validate-distribution-jsonl",
+        "validate-distribution",
         help="Validate every row of a learner-facing distribution JSONL file.",
     )
     validate_distribution_jsonl_parser.add_argument(
@@ -888,7 +939,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     download_parser = subparsers.add_parser(
-        "download",
+        "fetch-snapshot",
         help="Download a Wiktionary snapshot archive for local inspection or staged ingest.",
     )
     download_parser.add_argument(
@@ -910,7 +961,7 @@ def _build_parser() -> argparse.ArgumentParser:
     download_parser.set_defaults(func=_cmd_download, _parser=download_parser)
 
     extract_parser = subparsers.add_parser(
-        "extract",
+        "unpack-snapshot",
         help="Extract a snapshot archive to a plain JSONL file for local inspection.",
     )
     extract_parser.add_argument(
@@ -933,7 +984,7 @@ def _build_parser() -> argparse.ArgumentParser:
     extract_parser.set_defaults(func=_cmd_extract, _parser=extract_parser)
 
     raw_ingest_parser = subparsers.add_parser(
-        "raw-ingest",
+        "ingest-snapshot",
         help="Run the tracked raw Wiktionary ingestion stage into the rewrite tables.",
     )
     raw_ingest_parser.add_argument(
@@ -966,11 +1017,11 @@ def _build_parser() -> argparse.ArgumentParser:
     raw_ingest_parser.set_defaults(func=_cmd_raw_ingest, _parser=raw_ingest_parser)
 
     pipeline_run_parser = subparsers.add_parser(
-        "pipeline-run",
-        help="Run the staged raw -> curated -> llm -> distribution pipeline from one command.",
+        "run",
+        help="Run the staged source -> entries -> definitions -> distribution workflow from one command.",
     )
     pipeline_run_parser.add_argument(
-        "--skip-db-init",
+        "--skip-init-db",
         action="store_true",
         help="Assume the database foundation is already applied.",
     )
@@ -1003,7 +1054,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run_parser.add_argument(
         "--curated-table",
         default=DEFAULT_CURATED_TABLE,
-        help="Target curated entries table (default: %(default)s).",
+        help="Target assembled-entries table (default: %(default)s).",
     )
     pipeline_run_parser.add_argument(
         "--relations-table",
@@ -1031,46 +1082,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Clear curated output tables before rebuilding them.",
     )
     pipeline_run_parser.add_argument(
-        "--llm-table",
+        "--definitions-table",
         default="llm.entry_enrichments",
-        help="Target LLM enrichment table (default: %(default)s).",
+        dest="llm_table",
+        help="Target generated-definitions table (default: %(default)s).",
     )
     pipeline_run_parser.add_argument(
         "--prompt-version",
         default=PROMPT_VERSION,
-        help="Prompt version identifier used for LLM enrichment and export (default: %(default)s).",
+        help="Prompt version identifier used for definition generation and export (default: %(default)s).",
     )
     pipeline_run_parser.add_argument(
-        "--llm-env-file",
-        help="Optional env file for LLM credentials. Defaults to --env-file.",
+        "--model-env-file",
+        dest="model_env_file",
+        help="Optional env file for model credentials. Defaults to --env-file.",
     )
     pipeline_run_parser.add_argument(
         "--limit-entries",
         type=int,
-        help="Optional limit on LLM-processed entries.",
+        help="Optional limit on definition-generation entries.",
     )
     pipeline_run_parser.add_argument(
         "--max-workers",
         type=int,
         default=4,
-        help="Default number of concurrent LLM worker threads when --worker-tiers is not set (default: %(default)s).",
+        help="Default number of concurrent model worker threads when --worker-tiers is not set (default: %(default)s).",
     )
     pipeline_run_parser.add_argument(
         "--worker-tiers",
         nargs="+",
         type=int,
-        help="Adaptive LLM worker tiers, retried in order until no unresolved entries remain. Example: --worker-tiers 50 12 4 1",
+        help="Adaptive model worker tiers, retried in order until no unresolved entries remain. Example: --worker-tiers 50 12 4 1",
     )
     pipeline_run_parser.add_argument(
         "--max-retries",
         type=int,
         default=3,
-        help="Maximum retries per entry during LLM enrichment (default: %(default)s).",
+        help="Maximum retries per entry during definition generation (default: %(default)s).",
     )
     pipeline_run_parser.add_argument(
         "--recompute-existing",
         action="store_true",
-        help="Re-enrich entries even if successful enrichments already exist.",
+        help="Regenerate definitions even if successful rows already exist.",
     )
     pipeline_run_parser.add_argument(
         "--artifact-table",
@@ -1084,7 +1137,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run_parser.add_argument(
         "--skip-distribution-export",
         action="store_true",
-        help="Run through LLM enrichment but skip the learner-facing distribution export.",
+        help="Run through definition generation but skip the learner-facing distribution export.",
     )
     pipeline_run_parser.add_argument(
         "--distribution-output",
@@ -1105,10 +1158,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run_parser.add_argument(
         "--include-unenriched-audit",
         action="store_true",
-        help="When writing the optional audit artifact, include entries without successful enrichments.",
+        help="When writing the optional audit artifact, include entries without successful definition rows.",
     )
+    _add_definition_language_options(pipeline_run_parser)
     _add_database_options(pipeline_run_parser)
-    pipeline_run_parser.set_defaults(func=_cmd_pipeline_run, _parser=pipeline_run_parser)
+    pipeline_run_parser.set_defaults(func=_cmd_run, _parser=pipeline_run_parser)
 
     return parser
 
