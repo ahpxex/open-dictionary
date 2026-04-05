@@ -197,6 +197,76 @@ def test_run_raw_ingest_stage_reuses_completed_empty_snapshot(
     assert second.snapshot_preexisting is True
 
 
+def test_run_raw_ingest_stage_resumes_failed_snapshot_from_checkpoint(
+    anomaly_jsonl_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    temp_database_url: str,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+
+    original_iter_source_items = loader_module.iter_source_items
+    original_load_snapshot = loader_module.load_snapshot
+    fail_state = {"should_fail": True, "seen": 0}
+
+    def flaky_iter_source_items(artifact):
+        for item in original_iter_source_items(artifact):
+            fail_state["seen"] += 1
+            if fail_state["should_fail"] and fail_state["seen"] > 2:
+                fail_state["should_fail"] = False
+                raise RuntimeError("forced mid-stream failure")
+            yield item
+
+    def chunked_load_snapshot(conn, **kwargs):
+        return original_load_snapshot(conn, chunk_size=2, **kwargs)
+
+    monkeypatch.setattr(loader_module, "iter_source_items", flaky_iter_source_items)
+    monkeypatch.setattr(stage_module, "load_snapshot", chunked_load_snapshot)
+
+    with pytest.raises(RuntimeError, match="forced mid-stream failure"):
+        stage_module.run_raw_ingest_stage(
+            settings=settings,
+            workdir=anomaly_jsonl_path.parent,
+            archive_path=anomaly_jsonl_path,
+        )
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select run_id
+                from meta.pipeline_runs
+                where stage = %s and status = 'failed'
+                order by started_at desc
+                limit 1
+                """,
+                (RAW_INGEST_STAGE,),
+            )
+            failed_run_id = cursor.fetchone()[0]
+
+    result = stage_module.run_raw_ingest_stage(
+        settings=settings,
+        workdir=anomaly_jsonl_path.parent,
+        archive_path=anomaly_jsonl_path,
+    )
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("select count(*) from raw.wiktionary_entries")
+            row_count = cursor.fetchone()[0]
+            cursor.execute("select count(*) from raw.wiktionary_ingest_anomalies")
+            anomaly_count = cursor.fetchone()[0]
+
+    assert result.rows_loaded == 2
+    assert result.anomalies_logged == 2
+    assert result.snapshot_preexisting is False
+    assert result.resumed_from_run_id == failed_run_id
+    assert row_count == 2
+    assert anomaly_count == 2
+
+
 def test_flush_rows_returns_zero_for_empty_batch() -> None:
     # This case locks in the no-op guard so callers can safely flush at stage
     # boundaries without pre-checking the batch themselves.

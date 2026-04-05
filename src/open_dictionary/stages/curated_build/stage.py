@@ -40,8 +40,16 @@ def run_curated_build_stage(
     lang_codes: list[str] | None = None,
     limit_groups: int | None = None,
     replace_existing: bool = False,
+    parent_run_id: UUID | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> CuratedBuildResult:
+    with get_connection(settings) as conn:
+        source_run_ids, source_snapshot_ids = _resolve_raw_lineage(
+            conn,
+            source_table=source_table,
+            lang_codes=lang_codes,
+        )
+
     with get_connection(settings) as conn:
         run_id = start_run(
             conn,
@@ -54,7 +62,10 @@ def run_curated_build_stage(
                 "lang_codes": lang_codes or [],
                 "limit_groups": limit_groups,
                 "replace_existing": replace_existing,
+                "source_run_ids": source_run_ids,
+                "source_snapshot_ids": source_snapshot_ids,
             },
+            parent_run_id=parent_run_id,
         )
 
     groups_processed = 0
@@ -145,6 +156,8 @@ def run_curated_build_stage(
                     "entries_written": entries_written,
                     "relations_written": relations_written,
                     "triage_written": triage_written,
+                    "source_run_ids": source_run_ids,
+                    "source_snapshot_ids": source_snapshot_ids,
                 },
             )
             emit_progress(
@@ -361,3 +374,30 @@ def _identifier_from_dotted(qualified_name: str) -> sql.Identifier:
     if not parts:
         raise ValueError("Identifier name cannot be empty")
     return sql.Identifier(*parts)
+
+
+def _resolve_raw_lineage(
+    conn,
+    *,
+    source_table: str,
+    lang_codes: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    table_identifier = _identifier_from_dotted(source_table)
+    query = sql.SQL(
+        """
+        SELECT
+            array_remove(array_agg(DISTINCT run_id::text), NULL),
+            array_remove(array_agg(DISTINCT snapshot_id::text), NULL)
+        FROM {}
+        """
+    ).format(table_identifier)
+    params: list[Any] = []
+    if lang_codes:
+        query += sql.SQL(" WHERE lang_code = ANY(%s)")
+        params.append(lang_codes)
+
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
+        source_run_ids, source_snapshot_ids = cursor.fetchone()
+
+    return sorted(source_run_ids or []), sorted(source_snapshot_ids or [])

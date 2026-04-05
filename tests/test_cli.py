@@ -54,6 +54,7 @@ from open_dictionary.llm.prompt import PROMPT_VERSION, build_prompt_bundle
                     anomalies_logged=0,
                     archive_sha256="sha",
                     snapshot_preexisting=False,
+                    resumed_from_run_id=None,
                 ),
             },
             "ingest-snapshot",
@@ -116,6 +117,20 @@ from open_dictionary.llm.prompt import PROMPT_VERSION, build_prompt_bundle
             "export-distribution",
             {"entry_count": 741},
         ),
+        (
+            ["export-distribution-sqlite", "--output", "data/export/distribution.sqlite"],
+            {
+                "load_settings": lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
+                "run_export_distribution_sqlite_stage": lambda **kwargs: SimpleNamespace(
+                    run_id=uuid4(),
+                    entry_count=741,
+                    output_path=Path("data/export/distribution.sqlite"),
+                    output_sha256="sqlite-sha",
+                ),
+            },
+            "export-distribution-sqlite",
+            {"entry_count": 741, "sqlite_schema_version": "distribution_sqlite_v1"},
+        ),
     ],
 )
 def test_cli_commands_emit_consistent_json_results(
@@ -154,10 +169,18 @@ def test_pipeline_run_executes_stages_and_prints_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: dict[str, object] = {}
+    workflow_run_id = uuid4()
     prompt_bundle = build_prompt_bundle(
         prompt_version=PROMPT_VERSION,
         definition_language=DEFAULT_DEFINITION_LANGUAGE,
     )
+
+    class DummyConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
     def fake_raw(**kwargs):
         calls["source"] = kwargs
@@ -169,6 +192,7 @@ def test_pipeline_run_executes_stages_and_prints_summary(
             anomalies_logged=0,
             snapshot_preexisting=False,
             archive_sha256="sha",
+            resumed_from_run_id=None,
         )
 
     def fake_curated(**kwargs):
@@ -202,6 +226,15 @@ def test_pipeline_run_executes_stages_and_prints_summary(
             output_sha256="dist-sha",
         )
 
+    def fake_distribution_sqlite(**kwargs):
+        calls["distribution_sqlite"] = kwargs
+        return SimpleNamespace(
+            run_id=uuid4(),
+            entry_count=741,
+            output_path=Path("data/export/distribution.sqlite"),
+            output_sha256="sqlite-sha",
+        )
+
     def fake_audit(**kwargs):
         calls["audit"] = kwargs
         return SimpleNamespace(
@@ -216,10 +249,15 @@ def test_pipeline_run_executes_stages_and_prints_summary(
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
     )
+    monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
+    monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: workflow_run_id)
+    monkeypatch.setattr(cli, "complete_run", lambda conn, **kwargs: None)
+    monkeypatch.setattr(cli, "fail_run", lambda conn, **kwargs: None)
     monkeypatch.setattr(cli, "run_raw_ingest_stage", fake_raw)
     monkeypatch.setattr(cli, "run_curated_build_stage", fake_curated)
     monkeypatch.setattr(cli, "run_llm_enrich_stage", fake_llm)
     monkeypatch.setattr(cli, "run_export_distribution_jsonl_stage", fake_distribution)
+    monkeypatch.setattr(cli, "run_export_distribution_sqlite_stage", fake_distribution_sqlite)
     monkeypatch.setattr(cli, "run_export_audit_jsonl_stage", fake_audit)
     pending_counts = iter([742, 0])
     monkeypatch.setattr(cli, "_count_pending_llm_entries", lambda *args, **kwargs: next(pending_counts))
@@ -240,6 +278,8 @@ def test_pipeline_run_executes_stages_and_prints_summary(
             "--validate-distribution",
             "--distribution-output",
             "data/export/distribution.jsonl",
+            "--distribution-sqlite-output",
+            "data/export/distribution.sqlite",
             "--audit-output",
             "data/export/audit.jsonl",
             "--model-env-file",
@@ -254,18 +294,23 @@ def test_pipeline_run_executes_stages_and_prints_summary(
     assert calls["definitions"]["definition_language"] == DEFAULT_DEFINITION_LANGUAGE
     assert calls["distribution"]["output_path"] == Path("data/export/distribution.jsonl")
     assert calls["distribution"]["definition_language"] == DEFAULT_DEFINITION_LANGUAGE
+    assert calls["distribution_sqlite"]["output_path"] == Path("data/export/distribution.sqlite")
+    assert calls["distribution_sqlite"]["definition_language"] == DEFAULT_DEFINITION_LANGUAGE
     assert calls["audit"]["output_path"] == Path("data/export/audit.jsonl")
 
     captured = capsys.readouterr()
     summary = json.loads(captured.out)
     assert summary["command"] == "run"
     assert summary["status"] == "succeeded"
+    assert summary["workflow_run_id"] == str(workflow_run_id)
     assert summary["definitions"]["failed"] == 0
     assert summary["definitions"]["prompt_version"] == prompt_bundle.resolved_prompt_version
     assert summary["definitions"]["definition_language"]["code"] == DEFAULT_DEFINITION_LANGUAGE.code
     assert summary["distribution_export"]["entry_count"] == 741
     assert summary["distribution_export"]["validated_entry_count"] == 741
     assert summary["distribution_export"]["prompt_version"] == prompt_bundle.resolved_prompt_version
+    assert summary["distribution_sqlite_export"]["entry_count"] == 741
+    assert summary["distribution_sqlite_export"]["sqlite_schema_version"] == "distribution_sqlite_v1"
     assert summary["audit_export"]["entry_count"] == 742
     assert "[progress] stage=source.ingest event=acquire_complete" in captured.err
     assert "[progress] stage=definitions.generate event=generate_progress" in captured.err
@@ -274,11 +319,22 @@ def test_pipeline_run_executes_stages_and_prints_summary(
 def test_pipeline_run_stops_when_llm_has_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class DummyConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     monkeypatch.setattr(
         cli,
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
     )
+    monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
+    monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: uuid4())
+    monkeypatch.setattr(cli, "complete_run", lambda conn, **kwargs: None)
+    monkeypatch.setattr(cli, "fail_run", lambda conn, **kwargs: None)
     monkeypatch.setattr(
         cli,
         "run_raw_ingest_stage",
@@ -289,6 +345,7 @@ def test_pipeline_run_stops_when_llm_has_failures(
             anomalies_logged=0,
             snapshot_preexisting=False,
             archive_sha256="sha",
+            resumed_from_run_id=None,
         ),
     )
     monkeypatch.setattr(
@@ -332,12 +389,24 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: list[int] = []
+    workflow_run_id = uuid4()
+
+    class DummyConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
     monkeypatch.setattr(
         cli,
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
     )
+    monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
+    monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: workflow_run_id)
+    monkeypatch.setattr(cli, "complete_run", lambda conn, **kwargs: None)
+    monkeypatch.setattr(cli, "fail_run", lambda conn, **kwargs: None)
     monkeypatch.setattr(
         cli,
         "run_raw_ingest_stage",
@@ -348,6 +417,7 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
             anomalies_logged=0,
             snapshot_preexisting=False,
             archive_sha256="sha",
+            resumed_from_run_id=None,
         ),
     )
     monkeypatch.setattr(
@@ -383,6 +453,16 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
     )
     monkeypatch.setattr(
         cli,
+        "run_export_distribution_sqlite_stage",
+        lambda **kwargs: SimpleNamespace(
+            run_id=uuid4(),
+            entry_count=741,
+            output_path=Path("data/export/distribution.sqlite"),
+            output_sha256="sqlite-sha",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
         "validate_distribution_jsonl_file",
         lambda path, **kwargs: SimpleNamespace(output_path=Path(path), entry_count=741),
     )
@@ -397,6 +477,8 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
             "50",
             "12",
             "--validate-distribution",
+            "--distribution-sqlite-output",
+            "data/export/distribution.sqlite",
         ]
     )
 
@@ -405,9 +487,11 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
     summary = json.loads(capsys.readouterr().out)
     assert summary["command"] == "run"
     assert summary["status"] == "succeeded"
+    assert summary["workflow_run_id"] == str(workflow_run_id)
     assert summary["definitions"]["attempts"][0]["workers"] == 50
     assert summary["definitions"]["attempts"][1]["workers"] == 12
     assert summary["definitions"]["attempts"][1]["remaining_entries"] == 0
+    assert summary["distribution_sqlite_export"]["entry_count"] == 741
 
 
 def test_validate_distribution_jsonl_command_reads_file(

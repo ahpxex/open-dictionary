@@ -117,6 +117,15 @@ def test_curated_build_stage_creates_entries_relations_and_triage(
             triage = cursor.fetchone()[0]
             cursor.execute("select count(*) from curated.triage_queue where run_id is not null")
             triage_with_run_id = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                select config->'source_run_ids', stats->'source_run_ids', config->'source_snapshot_ids'
+                from meta.pipeline_runs
+                where run_id = %s
+                """,
+                (result.run_id,),
+            )
+            source_run_ids, stats_source_run_ids, source_snapshot_ids = cursor.fetchone()
 
     assert result.entries_written == entries
     assert result.relations_written == relations
@@ -126,6 +135,9 @@ def test_curated_build_stage_creates_entries_relations_and_triage(
     assert entries_with_run_id == entries
     assert relations_with_run_id == relations
     assert triage_with_run_id == triage
+    assert source_run_ids
+    assert stats_source_run_ids
+    assert source_snapshot_ids
 
 
 def test_curated_build_stage_filters_by_lang_codes(

@@ -15,6 +15,7 @@ from .contracts import DEFAULT_DEFINITION_LANGUAGE, normalize_language_spec
 from .db.bootstrap import LATEST_FOUNDATION_VERSION, apply_foundation
 from .db.connection import get_connection
 from .llm.prompt import PROMPT_VERSION, build_prompt_bundle
+from .pipeline import complete_run, fail_run, start_run
 from .sources.wiktionary import (
     DEFAULT_WIKTIONARY_SOURCE_URL,
     download_wiktionary_dump,
@@ -30,6 +31,11 @@ from .stages.export_distribution_jsonl import (
     EXPORT_DISTRIBUTION_JSONL_STAGE,
     run_export_distribution_jsonl_stage,
     validate_distribution_jsonl_file,
+)
+from .stages.export_distribution_sqlite import (
+    EXPORT_DISTRIBUTION_SQLITE_STAGE,
+    SQLITE_SCHEMA_VERSION,
+    run_export_distribution_sqlite_stage,
 )
 from .stages.export_jsonl import (
     EXPORT_AUDIT_JSONL_STAGE,
@@ -408,11 +414,59 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         prompt_version=args.prompt_version,
         definition_language=definition_language,
     )
+    workflow_run_id = None
+    raw_result = None
+    curated_result = None
+    llm_result = None
+    distribution_result = None
+    distribution_validation = None
+    distribution_sqlite_result = None
+    audit_result = None
 
     try:
         if not args.skip_init_db:
             with get_connection(settings) as conn:
                 apply_foundation(conn)
+
+        with get_connection(settings) as conn:
+            workflow_run_id = start_run(
+                conn,
+                stage="workflow.run",
+                config={
+                    "archive_path": str(args.archive_path) if args.archive_path is not None else None,
+                    "source_url": (
+                        args.source_url or DEFAULT_WIKTIONARY_SOURCE_URL
+                        if args.archive_path is None
+                        else None
+                    ),
+                    "workdir": str(args.workdir),
+                    "skip_init_db": args.skip_init_db,
+                    "raw_table": args.raw_table,
+                    "curated_table": args.curated_table,
+                    "relations_table": args.relations_table,
+                    "triage_table": args.triage_table,
+                    "definitions_table": args.llm_table,
+                    "artifact_table": args.artifact_table,
+                    "lang_codes": args.lang_codes or [],
+                    "limit_groups": args.limit_groups,
+                    "limit_entries": args.limit_entries,
+                    "worker_tiers": worker_tiers,
+                    "max_retries": args.max_retries,
+                    "recompute_existing": args.recompute_existing,
+                    "distribution_output": str(args.distribution_output),
+                    "distribution_sqlite_output": (
+                        str(args.distribution_sqlite_output)
+                        if args.distribution_sqlite_output is not None
+                        else None
+                    ),
+                    "audit_output": str(args.audit_output) if args.audit_output is not None else None,
+                    "validate_distribution": args.validate_distribution,
+                    "skip_distribution_export": args.skip_distribution_export,
+                    "prompt_template_version": args.prompt_version,
+                    "prompt_version": prompt_bundle.resolved_prompt_version,
+                    "definition_language": definition_language.as_dict(),
+                },
+            )
 
         raw_result = run_raw_ingest_stage(
             settings=settings,
@@ -425,6 +479,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             archive_path=args.archive_path,
             target_table=args.raw_table,
             overwrite_download=args.overwrite_download,
+            parent_run_id=workflow_run_id,
             progress_callback=progress_callback,
         )
 
@@ -437,11 +492,11 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             lang_codes=args.lang_codes,
             limit_groups=args.limit_groups,
             replace_existing=args.replace_existing_curated,
+            parent_run_id=workflow_run_id,
             progress_callback=progress_callback,
         )
 
         llm_attempts: list[dict[str, object]] = []
-        llm_result = None
         if args.limit_entries is not None:
             llm_result = run_llm_enrich_stage(
                 settings=settings,
@@ -454,6 +509,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 max_workers=worker_tiers[0],
                 max_retries=args.max_retries,
                 recompute_existing=args.recompute_existing,
+                parent_run_id=workflow_run_id,
                 progress_callback=progress_callback,
             )
             llm_attempts.append(
@@ -503,6 +559,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                     max_workers=workers,
                     max_retries=args.max_retries,
                     recompute_existing=args.recompute_existing,
+                    parent_run_id=workflow_run_id,
                     progress_callback=progress_callback,
                 )
                 remaining_entries = _count_pending_llm_entries(
@@ -547,7 +604,6 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
 
         assert llm_result is not None
 
-        distribution_result = None
         if not args.skip_distribution_export:
             distribution_result = run_export_distribution_jsonl_stage(
                 settings=settings,
@@ -558,6 +614,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 model=args.model,
                 prompt_version=args.prompt_version,
                 definition_language=definition_language,
+                parent_run_id=workflow_run_id,
                 progress_callback=progress_callback,
             )
             if args.validate_distribution:
@@ -570,7 +627,20 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         else:
             distribution_validation = None
 
-        audit_result = None
+        if args.distribution_sqlite_output is not None:
+            distribution_sqlite_result = run_export_distribution_sqlite_stage(
+                settings=settings,
+                output_path=args.distribution_sqlite_output,
+                curated_table=args.curated_table,
+                llm_table=args.llm_table,
+                artifact_table=args.artifact_table,
+                model=args.model,
+                prompt_version=args.prompt_version,
+                definition_language=definition_language,
+                parent_run_id=workflow_run_id,
+                progress_callback=progress_callback,
+            )
+
         if args.audit_output is not None:
             audit_result = run_export_audit_jsonl_stage(
                 settings=settings,
@@ -582,18 +652,66 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 prompt_version=args.prompt_version,
                 definition_language=definition_language,
                 include_unenriched=args.include_unenriched_audit,
+                parent_run_id=workflow_run_id,
                 progress_callback=progress_callback,
             )
     except (psycopg.Error, ValueError, RuntimeError) as exc:
+        if workflow_run_id is not None:
+            with get_connection(settings) as conn:
+                fail_run(
+                    conn,
+                    run_id=workflow_run_id,
+                    error=str(exc),
+                    stats={
+                        "source_run_id": str(raw_result.run_id) if raw_result is not None else None,
+                        "entries_run_id": str(curated_result.run_id) if curated_result is not None else None,
+                        "definitions_run_id": str(llm_result.run_id) if llm_result is not None else None,
+                        "distribution_export_run_id": (
+                            str(distribution_result.run_id) if distribution_result is not None else None
+                        ),
+                        "distribution_sqlite_export_run_id": (
+                            str(distribution_sqlite_result.run_id)
+                            if distribution_sqlite_result is not None
+                            else None
+                        ),
+                        "audit_export_run_id": str(audit_result.run_id) if audit_result is not None else None,
+                    },
+                )
         args._parser.error(str(exc))
 
+    if workflow_run_id is not None:
+        with get_connection(settings) as conn:
+            complete_run(
+                conn,
+                run_id=workflow_run_id,
+                stats={
+                    "source_run_id": str(raw_result.run_id),
+                    "snapshot_id": str(raw_result.snapshot_id),
+                    "entries_run_id": str(curated_result.run_id),
+                    "definitions_run_id": str(llm_result.run_id),
+                    "distribution_export_run_id": (
+                        str(distribution_result.run_id) if distribution_result is not None else None
+                    ),
+                    "distribution_sqlite_export_run_id": (
+                        str(distribution_sqlite_result.run_id)
+                        if distribution_sqlite_result is not None
+                        else None
+                    ),
+                    "audit_export_run_id": str(audit_result.run_id) if audit_result is not None else None,
+                },
+            )
+
     summary = {
+        "workflow_run_id": str(workflow_run_id) if workflow_run_id is not None else None,
         "db_initialized": not args.skip_init_db,
         "source": {
             "run_id": str(raw_result.run_id),
             "snapshot_id": str(raw_result.snapshot_id),
             "rows_loaded": raw_result.rows_loaded,
             "anomalies_logged": raw_result.anomalies_logged,
+            "resumed_from_run_id": (
+                str(raw_result.resumed_from_run_id) if raw_result.resumed_from_run_id is not None else None
+            ),
         },
         "entries": {
             "run_id": str(curated_result.run_id),
@@ -630,6 +748,20 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
             if distribution_result is not None
             else None
         ),
+        "distribution_sqlite_export": (
+            {
+                "run_id": str(distribution_sqlite_result.run_id),
+                "entry_count": distribution_sqlite_result.entry_count,
+                "output_path": str(distribution_sqlite_result.output_path),
+                "output_sha256": distribution_sqlite_result.output_sha256,
+                "prompt_template_version": args.prompt_version,
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": definition_language.as_dict(),
+                "sqlite_schema_version": SQLITE_SCHEMA_VERSION,
+            }
+            if distribution_sqlite_result is not None
+            else None
+        ),
         "audit_export": (
             {
                 "run_id": str(audit_result.run_id),
@@ -650,6 +782,46 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     return _cmd_pipeline_run(args)
+
+
+def _cmd_export_distribution_sqlite(args: argparse.Namespace) -> int:
+    settings = _get_settings(args)
+    progress_callback = _make_progress_callback()
+    definition_language = _get_definition_language(args)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=args.prompt_version,
+        definition_language=definition_language,
+    )
+
+    try:
+        result = run_export_distribution_sqlite_stage(
+            settings=settings,
+            output_path=args.output,
+            curated_table=args.curated_table,
+            llm_table=args.llm_table,
+            artifact_table=args.artifact_table,
+            model=args.model,
+            prompt_version=args.prompt_version,
+            definition_language=definition_language,
+            progress_callback=progress_callback,
+        )
+    except (psycopg.Error, ValueError, RuntimeError) as exc:
+        args._parser.error(str(exc))
+
+    _print_command_result(
+        "export-distribution-sqlite",
+        stage=EXPORT_DISTRIBUTION_SQLITE_STAGE,
+        schema_version=DISTRIBUTION_SCHEMA_VERSION,
+        sqlite_schema_version=SQLITE_SCHEMA_VERSION,
+        run_id=str(result.run_id),
+        entry_count=result.entry_count,
+        output_path=str(result.output_path),
+        output_sha256=result.output_sha256,
+        prompt_template_version=args.prompt_version,
+        prompt_version=prompt_bundle.resolved_prompt_version,
+        definition_language=definition_language.as_dict(),
+    )
+    return 0
 
 
 def _cmd_validate_distribution_jsonl(args: argparse.Namespace) -> int:
@@ -723,6 +895,9 @@ def _cmd_raw_ingest(args: argparse.Namespace) -> int:
         rows_loaded=result.rows_loaded,
         anomalies_logged=result.anomalies_logged,
         snapshot_preexisting=result.snapshot_preexisting,
+        resumed_from_run_id=(
+            str(result.resumed_from_run_id) if result.resumed_from_run_id is not None else None
+        ),
         archive_path=str(result.archive_path),
         archive_sha256=result.archive_sha256,
     )
@@ -921,6 +1096,48 @@ def _build_parser() -> argparse.ArgumentParser:
     export_distribution_jsonl_parser.set_defaults(
         func=_cmd_export_distribution_jsonl,
         _parser=export_distribution_jsonl_parser,
+    )
+
+    export_distribution_sqlite_parser = subparsers.add_parser(
+        "export-distribution-sqlite",
+        help="Export the learner-facing distribution artifact as SQLite.",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/export/distribution.sqlite"),
+        help="Output SQLite path (default: %(default)s).",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--curated-table",
+        default="curated.entries",
+        help="Source assembled-entries table (default: %(default)s).",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--definitions-table",
+        default="llm.entry_enrichments",
+        dest="llm_table",
+        help="Source generated-definitions table (default: %(default)s).",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--artifact-table",
+        default="export.artifacts",
+        help="Export artifact metadata table (default: %(default)s).",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--model",
+        help="Optional model filter when choosing the latest successful definition run.",
+    )
+    export_distribution_sqlite_parser.add_argument(
+        "--prompt-version",
+        default=PROMPT_VERSION,
+        help="Prompt version required for distribution export (default: %(default)s).",
+    )
+    _add_definition_language_options(export_distribution_sqlite_parser)
+    _add_database_options(export_distribution_sqlite_parser)
+    export_distribution_sqlite_parser.set_defaults(
+        func=_cmd_export_distribution_sqlite,
+        _parser=export_distribution_sqlite_parser,
     )
 
     validate_distribution_jsonl_parser = subparsers.add_parser(
@@ -1144,6 +1361,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/export/distribution.jsonl"),
         help="Output path for the learner-facing distribution export (default: %(default)s).",
+    )
+    pipeline_run_parser.add_argument(
+        "--distribution-sqlite-output",
+        type=Path,
+        help="Optional output path for the learner-facing distribution SQLite export. Omit to skip SQLite export.",
     )
     pipeline_run_parser.add_argument(
         "--validate-distribution",

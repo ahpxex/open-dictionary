@@ -2,18 +2,19 @@
 
 ## Status
 
-Open Dictionary currently has two implemented JSONL exports:
+Open Dictionary currently has three implemented export artifacts:
 
 - `audit_jsonl`
 - `distribution_jsonl`
+- `distribution_sqlite`
 
 The audit artifact is internal.
-The distribution artifact is the learner-facing final format.
+The distribution artifacts are the learner-facing final formats.
 
-Both artifact types record upstream run lineage in `export.artifacts.metadata`,
+Each artifact records upstream run lineage in `export.artifacts.metadata`,
 including `curated_run_ids` and `llm_run_ids`.
 
-The project must keep these two export classes distinct:
+The project must keep these export classes distinct:
 
 - audit export: preserves stage boundaries for debugging and reproducibility
 - distribution export: final product contract for downstream clients
@@ -101,6 +102,36 @@ The short gloss is only a helper field.
 Rows with no distributable meanings are excluded from `distribution_jsonl`
 entirely. The export metadata records the number of skipped entries under
 `skipped_entries_without_meanings`.
+
+## Distribution SQLite
+
+The implemented SQLite artifact stores the same learner-facing
+`distribution_entry_v1` content under a SQLite packaging schema
+`distribution_sqlite_v1`.
+
+Goals:
+
+- preserve the exact product row via `entries.document_json`
+- support downstream querying without reparsing JSONL
+- keep distribution lineage and schema metadata inside the artifact itself
+
+The SQLite artifact currently includes:
+
+- `metadata`
+- `entries`
+- `entry_study_notes`
+- `etymologies`
+- `pos_groups`
+- `pos_group_forms`
+- `pos_group_pronunciations`
+- `pos_group_relations`
+- `meanings`
+- `meaning_examples`
+- `meaning_relations`
+
+The SQLite export must not invent a second product contract.
+It is a packaging of the same `distribution_entry_v1` semantics, not a new
+editorial model.
 
 ### Language rule
 

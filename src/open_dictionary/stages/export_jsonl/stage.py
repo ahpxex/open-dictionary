@@ -14,7 +14,7 @@ from open_dictionary.config import RuntimeSettings
 from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.prompt import build_prompt_bundle
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 
 
 EXPORT_AUDIT_JSONL_STAGE = "audit.export"
@@ -42,6 +42,7 @@ def run_export_jsonl_stage(
     prompt_version: str | None = None,
     definition_language: LanguageSpec | dict[str, Any] = DEFAULT_DEFINITION_LANGUAGE,
     include_unenriched: bool = True,
+    parent_run_id: UUID | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
     language = normalize_language_spec(definition_language)
@@ -74,6 +75,7 @@ def run_export_jsonl_stage(
                 "include_unenriched": include_unenriched,
                 "artifact_role": "audit",
             },
+            parent_run_id=parent_run_id,
         )
 
     try:
@@ -116,6 +118,14 @@ def run_export_jsonl_stage(
             output_sha256=output_sha256,
         )
         with get_connection(settings) as conn:
+            update_run_config(
+                conn,
+                run_id=run_id,
+                config_updates={
+                    "curated_run_ids": curated_run_ids,
+                    "definition_run_ids": llm_run_ids,
+                },
+            )
             record_export_artifact(
                 conn,
                 artifact_table=artifact_table,

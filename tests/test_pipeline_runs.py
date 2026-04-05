@@ -83,3 +83,28 @@ def test_fail_run_marks_run_failed_with_error(temp_database_url: str) -> None:
     assert error == "boom"
     assert rows_loaded == "7"
     assert has_finished_at is True
+
+
+def test_start_run_records_parent_run_id(temp_database_url: str) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        parent_run_id = start_run(conn, stage="workflow.run")
+        child_run_id = start_run(
+            conn,
+            stage="test.stage",
+            parent_run_id=parent_run_id,
+        )
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select parent_run_id
+                from meta.pipeline_runs
+                where run_id = %s
+                """,
+                (child_run_id,),
+            )
+            stored_parent_run_id = cursor.fetchone()[0]
+
+    assert stored_parent_run_id == parent_run_id

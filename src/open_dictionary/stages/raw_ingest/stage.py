@@ -8,7 +8,7 @@ from psycopg.types.json import Jsonb
 
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.db.connection import get_connection
-from open_dictionary.pipeline import ProgressCallback, complete_run, emit_progress, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, complete_run, emit_progress, fail_run, start_run, update_run_config
 from open_dictionary.sources.wiktionary import (
     DEFAULT_WIKTIONARY_SOURCE_URL,
     SnapshotRequest,
@@ -31,6 +31,7 @@ class RawIngestResult:
     anomalies_logged: int
     archive_sha256: str
     snapshot_preexisting: bool
+    resumed_from_run_id: UUID | None = None
 
 
 def run_raw_ingest_stage(
@@ -41,6 +42,7 @@ def run_raw_ingest_stage(
     archive_path: Path | None = None,
     target_table: str = DEFAULT_RAW_TABLE,
     overwrite_download: bool = False,
+    parent_run_id: UUID | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> RawIngestResult:
     emit_progress(
@@ -87,6 +89,7 @@ def run_raw_ingest_stage(
                 "acquisition_mode": artifact.acquisition_mode,
                 "snapshot_id": str(snapshot_id),
             },
+            parent_run_id=parent_run_id,
         )
 
     try:
@@ -100,6 +103,14 @@ def run_raw_ingest_stage(
                 stage_name=RAW_INGEST_STAGE,
                 progress_callback=progress_callback,
             )
+            if stats.resumed_from_run_id is not None:
+                update_run_config(
+                    conn,
+                    run_id=run_id,
+                    config_updates={
+                        "resume_from_run_id": str(stats.resumed_from_run_id),
+                    },
+                )
             complete_run(
                 conn,
                 run_id=run_id,
@@ -112,6 +123,9 @@ def run_raw_ingest_stage(
                     "archive_sha256": artifact.archive_sha256,
                     "archive_size_bytes": artifact.archive_size_bytes,
                     "snapshot_preexisting": stats.snapshot_preexisting,
+                    "resume_from_run_id": (
+                        str(stats.resumed_from_run_id) if stats.resumed_from_run_id is not None else None
+                    ),
                 },
             )
 
@@ -123,6 +137,7 @@ def run_raw_ingest_stage(
             anomalies_logged=stats.anomalies_logged,
             archive_sha256=artifact.archive_sha256,
             snapshot_preexisting=stats.snapshot_preexisting,
+            resumed_from_run_id=stats.resumed_from_run_id,
         )
     except Exception as exc:
         with get_connection(settings) as conn:

@@ -629,6 +629,50 @@ def test_persist_enrichment_failure_stores_error_row(temp_database_url: str) -> 
     assert error == "boom"
 
 
+def test_run_llm_enrich_stage_records_upstream_curated_run_ids(
+    tmp_path: Path,
+    temp_database_url: str,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LLM_API=http://127.0.0.1:3888/v1\nLLM_KEY=EMPTY\nLLM_MODEL=test-model\n",
+        encoding="utf-8",
+    )
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        entry_id = seed_curated_entry(conn)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "select run_id::text from curated.entries where entry_id = %s",
+                (entry_id,),
+            )
+            curated_run_id = cursor.fetchone()[0]
+
+    result = llm_stage.run_llm_enrich_stage(
+        settings=settings,
+        env_file=str(env_file),
+        client=FakeLLMClient([json.dumps(valid_payload("noun"))]),
+        max_workers=1,
+    )
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select config->'source_run_ids', stats->'source_run_ids'
+                from meta.pipeline_runs
+                where run_id = %s
+                """,
+                (result.run_id,),
+            )
+            source_run_ids, stats_source_run_ids = cursor.fetchone()
+
+    assert source_run_ids == [curated_run_id]
+    assert stats_source_run_ids == [curated_run_id]
+
+
 def test_run_llm_enrich_stage_processes_curated_entries_with_fake_client(tmp_path: Path, temp_database_url: str) -> None:
     # This case drives the entire stage end to end without a live model service.
     env_file = tmp_path / ".env"

@@ -53,6 +53,27 @@ def complete_run(
     )
 
 
+def update_run_config(
+    conn: psycopg.Connection,
+    *,
+    run_id: UUID,
+    config_updates: dict[str, Any],
+) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE meta.pipeline_runs
+            SET config = config || %s
+            WHERE run_id = %s
+            """,
+            (
+                Jsonb(config_updates),
+                run_id,
+            ),
+        )
+    conn.commit()
+
+
 def fail_run(
     conn: psycopg.Connection,
     *,

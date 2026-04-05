@@ -8,7 +8,7 @@ The current rewrite line is PostgreSQL-first and contract-driven:
 - raw source snapshots are ingested into tracked PostgreSQL tables
 - assembled entries are produced as word-centric learner-entry skeletons
 - definition generation produces learner-facing explanatory fields in an explicit target definition language
-- final read-only artifacts are exported as distribution JSONL and audit JSONL
+- final read-only artifacts are exported as distribution JSONL, distribution SQLite, and audit JSONL
 
 ## Prerequisites
 
@@ -37,6 +37,7 @@ curated learner-entry skeletons
 
 curated structure + generated explanations
   -> export-distribution
+  -> export-distribution-sqlite
   -> validate-distribution
 
 optional debug artifact
@@ -91,6 +92,7 @@ uv run opend run \
   --model-env-file .env \
   --worker-tiers 50 12 4 1 \
   --distribution-output data/export/distribution.jsonl \
+  --distribution-sqlite-output data/export/distribution.sqlite \
   --audit-output data/export/audit.jsonl \
   --validate-distribution
 ```
@@ -116,6 +118,7 @@ Useful pipeline flags:
 - `--limit-entries 50`
 - `--worker-tiers 50 12 4 1`
 - `--distribution-output data/export/distribution.jsonl`
+- `--distribution-sqlite-output data/export/distribution.sqlite`
 - `--audit-output data/export/audit.jsonl`
 - `--validate-distribution`
 - `--definition-language-code fr`
@@ -255,6 +258,29 @@ uv run opend validate-distribution \
   --input data/export/distribution.jsonl
 ```
 
+## Export Distribution SQLite
+
+Export the learner-facing final SQLite artifact:
+
+```bash
+uv run opend export-distribution-sqlite --output data/export/distribution.sqlite
+```
+
+Useful flags:
+
+```bash
+uv run opend export-distribution-sqlite --model Qwen/Qwen3.5-35B-A3B-FP8
+uv run opend export-distribution-sqlite --prompt-version curated_v1_distribution_fields_v2
+uv run opend export-distribution-sqlite --definition-language-code en --definition-language-name English
+```
+
+This export:
+
+- contains the same learner-facing `distribution_entry_v1` content as the JSONL export
+- stores the exact document row in `entries.document_json` for lossless round-trip
+- also normalizes the artifact into queryable SQLite tables such as `entries`, `pos_groups`, `meanings`, `meaning_examples`, and relation tables
+- records upstream run lineage and export metadata both in PostgreSQL `export.artifacts` and inside the SQLite `metadata` table
+
 ## Optional Snapshot Utilities
 
 Download the compressed snapshot archive for local inspection:
@@ -283,5 +309,6 @@ The main commands are:
 - `generate-definitions`
 - `export-audit`
 - `export-distribution`
+- `export-distribution-sqlite`
 - `validate-distribution`
 - `run`

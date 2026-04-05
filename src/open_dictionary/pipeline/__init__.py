@@ -1,5 +1,5 @@
 from .progress import ProgressCallback, ThrottledProgressReporter, emit_progress
-from .runs import complete_run, fail_run, start_run
+from .runs import complete_run, fail_run, start_run, update_run_config
 
 __all__ = [
     "ProgressCallback",
@@ -8,4 +8,5 @@ __all__ = [
     "emit_progress",
     "fail_run",
     "start_run",
+    "update_run_config",
 ]

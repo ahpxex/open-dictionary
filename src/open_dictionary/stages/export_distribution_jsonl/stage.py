@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from psycopg import sql
 
@@ -9,7 +10,7 @@ from open_dictionary.config import RuntimeSettings
 from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id, build_prompt_bundle
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 from open_dictionary.stages.export_distribution_jsonl.schema import DISTRIBUTION_SCHEMA_VERSION, validate_distribution_document
 from open_dictionary.stages.export_jsonl.stage import ExportJSONLResult, identifier_from_dotted, record_export_artifact, write_jsonl_atomic
 
@@ -27,6 +28,7 @@ def run_export_distribution_jsonl_stage(
     model: str | None = None,
     prompt_version: str = PROMPT_VERSION,
     definition_language: LanguageSpec | dict[str, Any] = DEFAULT_DEFINITION_LANGUAGE,
+    parent_run_id: UUID | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> ExportJSONLResult:
     language = normalize_language_spec(definition_language)
@@ -51,6 +53,7 @@ def run_export_distribution_jsonl_stage(
                 "artifact_role": "distribution",
                 "definition_language": language.as_dict(),
             },
+            parent_run_id=parent_run_id,
         )
 
     try:
@@ -89,6 +92,14 @@ def run_export_distribution_jsonl_stage(
         llm_run_ids = sorted({record["llm_run_id"] for record in records if record["llm_run_id"]})
 
         with get_connection(settings) as conn:
+            update_run_config(
+                conn,
+                run_id=run_id,
+                config_updates={
+                    "curated_run_ids": curated_run_ids,
+                    "definition_run_ids": llm_run_ids,
+                },
+            )
             record_export_artifact(
                 conn,
                 artifact_table=artifact_table,

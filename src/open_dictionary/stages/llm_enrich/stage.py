@@ -17,7 +17,7 @@ from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
 from open_dictionary.llm.config import load_llm_settings
 from open_dictionary.llm.prompt import COMPACT_RETRY_MAX_TOKENS, DEFAULT_MAX_TOKENS, PROMPT_VERSION, PromptBundle, build_generation_source_payload, build_prompt_bundle, build_user_prompt
-from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run
+from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 
 from .schema import build_expected_generation_targets, validate_enrichment_payload
 
@@ -47,6 +47,7 @@ def run_llm_enrich_stage(
     max_retries: int = 3,
     recompute_existing: bool = False,
     client: OpenAICompatLLMClient | None = None,
+    parent_run_id: UUID | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> LLMEnrichResult:
     llm_settings = load_llm_settings(env_file=env_file)
@@ -73,6 +74,7 @@ def run_llm_enrich_stage(
                 "max_retries": max_retries,
                 "recompute_existing": recompute_existing,
             },
+            parent_run_id=parent_run_id,
         )
         ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
 
@@ -92,6 +94,22 @@ def run_llm_enrich_stage(
                 limit_entries=limit_entries,
             )
         )
+        source_run_ids = sorted(
+            {
+                str(item["source_run_id"])
+                for item in items
+                if item.get("source_run_id") is not None
+            }
+        )
+        with get_connection(settings) as conn:
+            update_run_config(
+                conn,
+                run_id=run_id,
+                config_updates={
+                    "queued_entries": len(items),
+                    "source_run_ids": source_run_ids,
+                },
+            )
         emit_progress(
             progress_callback,
             stage=LLM_ENRICH_STAGE,
@@ -172,6 +190,7 @@ def run_llm_enrich_stage(
                         "prompt_template_version": prompt_bundle.template_version,
                         "prompt_version": prompt_bundle.resolved_prompt_version,
                         "definition_language": language.as_dict(),
+                        "source_run_ids": source_run_ids,
                     },
                 )
                 emit_progress(
@@ -235,7 +254,7 @@ def iter_curated_entries(
     target_identifier = identifier_from_dotted(target_table)
     query = sql.SQL(
         """
-        SELECT e.entry_id, e.payload
+        SELECT e.run_id, e.entry_id, e.payload
         FROM {} AS e
         """
     ).format(source_identifier)
@@ -269,7 +288,7 @@ def iter_curated_entries(
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(query, params)
-            for entry_id, payload in cursor.fetchall():
+            for source_run_id, entry_id, payload in cursor.fetchall():
                 request_payload = {
                     "entry": build_generation_source_payload(
                         payload,
@@ -280,6 +299,7 @@ def iter_curated_entries(
                     "definition_language": prompt_bundle.definition_language.as_dict(),
                 }
                 yield {
+                    "source_run_id": source_run_id,
                     "entry_id": entry_id,
                     "payload": payload,
                     "request_payload": request_payload,
