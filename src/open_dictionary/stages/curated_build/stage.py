@@ -225,6 +225,11 @@ def persist_curated_output(
     relations_table: str,
     triage_table: str,
 ) -> int:
+    clear_group_triage(
+        conn,
+        triage_table=triage_table,
+        output=output,
+    )
     if output.entry is not None:
         upsert_entry(conn, target_table=target_table, run_id=run_id, entry=output.entry)
         replace_relations(
@@ -238,6 +243,26 @@ def persist_curated_output(
         insert_triage_item(conn, triage_table=triage_table, run_id=run_id, item=triage_item)
     conn.commit()
     return 1 if output.entry is not None else 0
+
+
+def clear_group_triage(conn, *, triage_table: str, output: CuratedBuildOutput) -> None:
+    lang_code, word = triage_group_identity(output)
+    if not lang_code or not word:
+        return
+    table_identifier = _identifier_from_dotted(triage_table)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("DELETE FROM {} WHERE lang_code = %s AND word = %s").format(table_identifier),
+            (lang_code, word),
+        )
+
+
+def triage_group_identity(output: CuratedBuildOutput) -> tuple[str | None, str | None]:
+    if output.entry is not None:
+        return output.entry["lang_code"], output.entry["normalized_word"]
+    if output.triage_items:
+        return output.triage_items[0].lang_code, output.triage_items[0].word
+    return None, None
 
 
 def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]) -> None:

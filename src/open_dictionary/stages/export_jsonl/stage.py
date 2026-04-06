@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 from open_dictionary.config import RuntimeSettings
 from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec, normalize_language_spec
 from open_dictionary.db.connection import get_connection
-from open_dictionary.llm.prompt import build_prompt_bundle
+from open_dictionary.llm.prompt import PromptBundle, build_enrichment_request_payload, build_prompt_bundle, compute_request_hash
 from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 
 
@@ -187,6 +187,18 @@ def iter_export_records(
     progress_callback: ProgressCallback | None = None,
 ):
     language = normalize_language_spec(definition_language)
+    if prompt_bundle is not None:
+        yield from _iter_export_records_with_prompt_bundle(
+            settings=settings,
+            curated_table=curated_table,
+            llm_table=llm_table,
+            model=model,
+            prompt_bundle=prompt_bundle,
+            include_unenriched=include_unenriched,
+            progress_callback=progress_callback,
+        )
+        return
+
     curated_identifier = identifier_from_dotted(curated_table)
     llm_identifier = identifier_from_dotted(llm_table)
 
@@ -281,6 +293,165 @@ def iter_export_records(
                     },
                 }
             reporter.report(event="export_progress", force=True, fetched_records=yielded)
+
+
+def _iter_export_records_with_prompt_bundle(
+    *,
+    settings: RuntimeSettings,
+    curated_table: str,
+    llm_table: str,
+    model: str | None,
+    prompt_bundle: PromptBundle,
+    include_unenriched: bool,
+    progress_callback: ProgressCallback | None,
+):
+    candidates = load_matching_enrichment_candidates(
+        settings=settings,
+        llm_table=llm_table,
+        model=model,
+        prompt_bundle=prompt_bundle,
+    )
+    reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_AUDIT_JSONL_STAGE)
+    yielded = 0
+    for curated_run_id, entry_id, lang_code, normalized_word, word, payload in iter_curated_rows(
+        settings=settings,
+        curated_table=curated_table,
+    ):
+        current_enrichment = select_matching_enrichment(
+            curated_payload=payload,
+            entry_id=entry_id,
+            prompt_bundle=prompt_bundle,
+            candidates=candidates,
+        )
+        if current_enrichment is None and not include_unenriched:
+            continue
+
+        yielded += 1
+        reporter.report(
+            event="export_progress",
+            fetched_records=yielded,
+        )
+        yield {
+            "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
+            "llm_run_id": current_enrichment["run_id"] if current_enrichment is not None else None,
+            "document": {
+                "entry_id": str(entry_id),
+                "lang_code": lang_code,
+                "normalized_word": normalized_word,
+                "word": word,
+                "entries": payload,
+                "definitions": (
+                    {
+                        "model": current_enrichment["model"],
+                        "prompt_version": current_enrichment["prompt_version"],
+                        "definition_language": {
+                            "code": current_enrichment["definition_language_code"],
+                            "name": current_enrichment["definition_language_name"],
+                        },
+                        "payload": current_enrichment["response_payload"],
+                    }
+                    if current_enrichment is not None
+                    else None
+                ),
+            },
+        }
+    reporter.report(event="export_progress", force=True, fetched_records=yielded)
+
+
+def iter_curated_rows(
+    *,
+    settings: RuntimeSettings,
+    curated_table: str,
+):
+    curated_identifier = identifier_from_dotted(curated_table)
+    query = sql.SQL(
+        """
+        SELECT
+            run_id,
+            entry_id,
+            lang_code,
+            normalized_word,
+            word,
+            payload
+        FROM {}
+        ORDER BY lang_code, normalized_word
+        """
+    ).format(curated_identifier)
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+            yield from cursor.fetchall()
+
+
+def load_matching_enrichment_candidates(
+    *,
+    settings: RuntimeSettings,
+    llm_table: str,
+    model: str | None,
+    prompt_bundle: PromptBundle,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    llm_identifier = identifier_from_dotted(llm_table)
+    query = sql.SQL(
+        """
+        SELECT
+            run_id::text,
+            entry_id::text,
+            model,
+            prompt_version,
+            definition_language_code,
+            definition_language_name,
+            response_payload,
+            input_hash
+        FROM {}
+        WHERE status = 'succeeded'
+          AND prompt_version = %s
+          AND definition_language_code = %s
+        """
+    ).format(llm_identifier)
+    params: list[Any] = [
+        prompt_bundle.resolved_prompt_version,
+        prompt_bundle.definition_language.code,
+    ]
+    if model is not None:
+        query += sql.SQL(" AND model = %s")
+        params.append(model)
+    query += sql.SQL(" ORDER BY entry_id, created_at DESC")
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+    candidates: dict[str, dict[str, dict[str, Any]]] = {}
+    for run_id, entry_id, enrich_model, enrich_prompt_version, definition_language_code, definition_language_name, response_payload, input_hash in rows:
+        candidate_bucket = candidates.setdefault(str(entry_id), {})
+        candidate_bucket.setdefault(
+            str(input_hash),
+            {
+                "run_id": str(run_id),
+                "model": enrich_model,
+                "prompt_version": enrich_prompt_version,
+                "definition_language_code": definition_language_code,
+                "definition_language_name": definition_language_name,
+                "response_payload": response_payload,
+            },
+        )
+    return candidates
+
+
+def select_matching_enrichment(
+    *,
+    curated_payload: dict[str, Any],
+    entry_id: Any,
+    prompt_bundle: PromptBundle,
+    candidates: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    request_payload = build_enrichment_request_payload(
+        curated_payload,
+        prompt_bundle=prompt_bundle,
+    )
+    input_hash = compute_request_hash(request_payload)
+    return candidates.get(str(entry_id), {}).get(input_hash)
 
 
 def iter_export_documents(

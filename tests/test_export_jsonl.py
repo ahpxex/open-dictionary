@@ -10,7 +10,7 @@ from open_dictionary.config.settings import RuntimeSettings
 from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
-from open_dictionary.llm.prompt import build_prompt_bundle
+from open_dictionary.llm.prompt import build_enrichment_request_payload, build_prompt_bundle, compute_request_hash
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.export_jsonl import stage as export_stage
 
@@ -68,11 +68,18 @@ def seed_llm_enrichment(
     created_offset: int = 0,
     payload: dict | None = None,
     status: str = "succeeded",
+    input_hash: str | None = None,
 ) -> None:
     definition_language = definition_language or DEFAULT_DEFINITION_LANGUAGE.as_dict()
     prompt_bundle = build_prompt_bundle(
         prompt_version=prompt_version,
         definition_language=definition_language,
+    )
+    with conn.cursor() as cursor:
+        cursor.execute("select payload from curated.entries where entry_id = %s", (entry_id,))
+        curated_payload = cursor.fetchone()[0]
+    resolved_input_hash = input_hash or compute_request_hash(
+        build_enrichment_request_payload(curated_payload, prompt_bundle=prompt_bundle)
     )
     run_id = start_run(conn, stage="definitions.generate")
     with conn.cursor() as cursor:
@@ -112,7 +119,7 @@ def seed_llm_enrichment(
                 prompt_bundle.resolved_prompt_version,
                 definition_language["code"],
                 definition_language["name"],
-                f"hash-{entry_id}-{model}-{prompt_bundle.resolved_prompt_version}-{created_offset}",
+                resolved_input_hash,
                 status,
                 json.dumps(payload or {"headword_summary": "headword summary"}),
                 json.dumps(payload or {"headword_summary": "headword summary"}),

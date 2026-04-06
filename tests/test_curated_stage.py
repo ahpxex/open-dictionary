@@ -203,3 +203,26 @@ def test_curated_build_stage_replace_existing_resets_outputs(
             entries = cursor.fetchone()[0]
 
     assert entries == 1
+
+
+def test_curated_build_stage_rerun_does_not_duplicate_group_triage(
+    temp_database_url: str,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        insert_raw_row(conn, word="倦", lang="Japanese", lang_code="ja", pos="character", source_line=1, gloss="in fatigue")
+        conn.commit()
+
+    first = run_curated_build_stage(settings=settings)
+    second = run_curated_build_stage(settings=settings)
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("select count(*) from curated.triage_queue")
+            triage_count = cursor.fetchone()[0]
+
+    assert first.triage_written == 1
+    assert second.triage_written == 1
+    assert triage_count == 1

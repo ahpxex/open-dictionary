@@ -18,6 +18,12 @@ The current rewrite line is PostgreSQL-first and contract-driven:
 - Configure a model env file with `LLM_API`, `LLM_KEY`, and `LLM_MODEL` when
   running `generate-definitions` or any pipeline command that reaches the definition-generation stage
 
+Default env-file behavior:
+
+- if you do not pass `--env-file`, commands read `./.env` from the current working directory
+- if you do not pass `--model-env-file`, LLM commands fall back to the same `--env-file` value
+- there is no automatic parent-directory or repo-root search beyond that explicit `./.env` default
+
 ## Pipeline Flow
 
 The rewrite pipeline is explicitly staged:

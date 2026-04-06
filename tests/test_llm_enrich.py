@@ -16,10 +16,12 @@ from open_dictionary.llm.config import LLMSettings
 from open_dictionary.llm.config import load_llm_settings
 from open_dictionary.llm.prompt import (
     PROMPT_VERSION,
+    build_enrichment_request_payload,
     build_prompt_bundle,
     build_generation_source_payload,
     build_pos_group_id,
     build_user_prompt,
+    compute_request_hash,
 )
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.llm_enrich import stage as llm_stage
@@ -492,6 +494,9 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
     with get_connection(settings) as conn:
         apply_foundation(conn)
         entry_id = seed_curated_entry(conn)
+        with conn.cursor() as cursor:
+            cursor.execute("select payload from curated.entries where entry_id = %s", (entry_id,))
+            curated_payload = cursor.fetchone()[0]
         llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
         with conn.cursor() as cursor:
             cursor.execute(
@@ -511,8 +516,10 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
                 "model": "test-model",
                 "prompt_version": prompt_bundle.resolved_prompt_version,
                 "definition_language": DEFAULT_DEFINITION_LANGUAGE,
-                "input_hash": "hash",
-                "request_payload": {"entry": "payload"},
+                "input_hash": compute_request_hash(
+                    build_enrichment_request_payload(curated_payload, prompt_bundle=prompt_bundle)
+                ),
+                "request_payload": build_enrichment_request_payload(curated_payload, prompt_bundle=prompt_bundle),
                 "response_payload": valid_payload(),
                 "raw_response": json.dumps(valid_payload()),
                 "retries": 0,
@@ -532,6 +539,57 @@ def test_iter_curated_entries_skips_existing_successes(temp_database_url: str) -
     )
 
     assert items == []
+
+
+def test_iter_curated_entries_does_not_skip_stale_successes(temp_database_url: str) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+    prompt_bundle = build_prompt_bundle(
+        prompt_version=PROMPT_VERSION,
+        definition_language=DEFAULT_DEFINITION_LANGUAGE,
+    )
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        entry_id = seed_curated_entry(conn)
+        llm_stage.ensure_prompt_version(conn, prompt_bundle=prompt_bundle)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into meta.pipeline_runs (run_id, stage, status, config)
+                values (gen_random_uuid(), 'definitions.generate', 'succeeded', '{}'::jsonb)
+                returning run_id
+                """
+            )
+            run_id = cursor.fetchone()[0]
+        llm_stage.persist_enrichment_success(
+            conn,
+            target_table="llm.entry_enrichments",
+            run_id=run_id,
+            record={
+                "entry_id": entry_id,
+                "model": "test-model",
+                "prompt_version": prompt_bundle.resolved_prompt_version,
+                "definition_language": DEFAULT_DEFINITION_LANGUAGE,
+                "input_hash": "stale-hash",
+                "request_payload": {"entry": "payload"},
+                "response_payload": valid_payload(),
+                "raw_response": json.dumps(valid_payload()),
+                "retries": 0,
+            },
+        )
+
+    items = list(
+        llm_stage.iter_curated_entries(
+            settings,
+            source_table="curated.entries",
+            target_table="llm.entry_enrichments",
+            prompt_bundle=prompt_bundle,
+            model="test-model",
+            recompute_existing=False,
+            limit_entries=None,
+        )
+    )
+
+    assert len(items) == 1
 
 
 def test_iter_curated_entries_recompute_existing_returns_entries(temp_database_url: str) -> None:

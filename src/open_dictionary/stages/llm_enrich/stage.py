@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE, LanguageSpec,
 from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.client import LLMClientError, OpenAICompatLLMClient
 from open_dictionary.llm.config import load_llm_settings
-from open_dictionary.llm.prompt import COMPACT_RETRY_MAX_TOKENS, DEFAULT_MAX_TOKENS, PROMPT_VERSION, PromptBundle, build_generation_source_payload, build_prompt_bundle, build_user_prompt
+from open_dictionary.llm.prompt import COMPACT_RETRY_MAX_TOKENS, DEFAULT_MAX_TOKENS, PROMPT_VERSION, PromptBundle, build_enrichment_request_payload, build_prompt_bundle, build_user_prompt, compute_request_hash
 from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 
 from .schema import build_expected_generation_targets, validate_enrichment_payload
@@ -251,60 +250,70 @@ def iter_curated_entries(
     limit_entries: int | None,
 ):
     source_identifier = identifier_from_dotted(source_table)
-    target_identifier = identifier_from_dotted(target_table)
+    existing_success_hashes = (
+        load_existing_success_hashes(
+            settings,
+            target_table=target_table,
+            prompt_bundle=prompt_bundle,
+            model=model,
+        )
+        if not recompute_existing
+        else {}
+    )
     query = sql.SQL(
         """
         SELECT e.run_id, e.entry_id, e.payload
         FROM {} AS e
         """
     ).format(source_identifier)
-    params: list[Any] = []
-    if not recompute_existing:
-        query += sql.SQL(
-            """
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM {} AS x
-                WHERE x.entry_id = e.entry_id
-                  AND x.model = %s
-                  AND x.prompt_version = %s
-                  AND x.definition_language_code = %s
-                  AND x.status = 'succeeded'
-            )
-            """
-        ).format(target_identifier)
-        params.extend(
-            (
-                model,
-                prompt_bundle.resolved_prompt_version,
-                prompt_bundle.definition_language.code,
-            )
-        )
     query += sql.SQL(" ORDER BY e.lang_code, e.normalized_word")
-    if limit_entries is not None:
-        query += sql.SQL(" LIMIT %s")
-        params.append(limit_entries)
+    params: list[Any] = []
 
     with get_connection(settings) as conn:
         with conn.cursor() as cursor:
             cursor.execute(query, params)
+            yielded = 0
             for source_run_id, entry_id, payload in cursor.fetchall():
-                request_payload = {
-                    "entry": build_generation_source_payload(
-                        payload,
-                        definition_language=prompt_bundle.definition_language,
-                    ),
-                    "prompt_template_version": prompt_bundle.template_version,
-                    "prompt_version": prompt_bundle.resolved_prompt_version,
-                    "definition_language": prompt_bundle.definition_language.as_dict(),
-                }
+                request_payload = build_enrichment_request_payload(
+                    payload,
+                    prompt_bundle=prompt_bundle,
+                )
+                input_hash = compute_input_hash(request_payload)
+                if not recompute_existing and input_hash in existing_success_hashes.get(str(entry_id), set()):
+                    continue
                 yield {
                     "source_run_id": source_run_id,
                     "entry_id": entry_id,
                     "payload": payload,
                     "request_payload": request_payload,
-                    "input_hash": compute_input_hash(request_payload),
+                    "input_hash": input_hash,
                 }
+                yielded += 1
+                if limit_entries is not None and yielded >= limit_entries:
+                    break
+
+
+def count_pending_entries(
+    settings: RuntimeSettings,
+    *,
+    source_table: str,
+    target_table: str,
+    prompt_bundle: PromptBundle,
+    model: str,
+    recompute_existing: bool,
+) -> int:
+    return sum(
+        1
+        for _ in iter_curated_entries(
+            settings,
+            source_table=source_table,
+            target_table=target_table,
+            prompt_bundle=prompt_bundle,
+            model=model,
+            recompute_existing=recompute_existing,
+            limit_entries=None,
+        )
+    )
 
 
 def enrich_one_entry(
@@ -454,8 +463,43 @@ def persist_enrichment_failure(
 
 
 def compute_input_hash(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return compute_request_hash(payload)
+
+
+def load_existing_success_hashes(
+    settings: RuntimeSettings,
+    *,
+    target_table: str,
+    prompt_bundle: PromptBundle,
+    model: str,
+) -> dict[str, set[str]]:
+    target_identifier = identifier_from_dotted(target_table)
+    query = sql.SQL(
+        """
+        SELECT entry_id::text, input_hash
+        FROM {}
+        WHERE status = 'succeeded'
+          AND model = %s
+          AND prompt_version = %s
+          AND definition_language_code = %s
+        """
+    ).format(target_identifier)
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                query,
+                (
+                    model,
+                    prompt_bundle.resolved_prompt_version,
+                    prompt_bundle.definition_language.code,
+                ),
+            )
+            rows = cursor.fetchall()
+
+    result: dict[str, set[str]] = {}
+    for entry_id, input_hash in rows:
+        result.setdefault(str(entry_id), set()).add(str(input_hash))
+    return result
 
 
 def identifier_from_dotted(qualified_name: str) -> sql.Identifier:

@@ -249,6 +249,11 @@ def test_pipeline_run_executes_stages_and_prints_summary(
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
     )
+    monkeypatch.setattr(
+        cli,
+        "load_llm_settings",
+        lambda **kwargs: SimpleNamespace(model="test-model"),
+    )
     monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
     monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: workflow_run_id)
     monkeypatch.setattr(cli, "complete_run", lambda conn, **kwargs: None)
@@ -331,6 +336,11 @@ def test_pipeline_run_stops_when_llm_has_failures(
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
     )
+    monkeypatch.setattr(
+        cli,
+        "load_llm_settings",
+        lambda **kwargs: SimpleNamespace(model="test-model"),
+    )
     monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
     monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: uuid4())
     monkeypatch.setattr(cli, "complete_run", lambda conn, **kwargs: None)
@@ -402,6 +412,11 @@ def test_pipeline_run_retries_with_worker_tiers_until_pending_is_zero(
         cli,
         "load_settings",
         lambda **kwargs: RuntimeSettings(database_url="postgresql://example/test"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_llm_settings",
+        lambda **kwargs: SimpleNamespace(model="test-model"),
     )
     monkeypatch.setattr(cli, "get_connection", lambda settings: DummyConnection())
     monkeypatch.setattr(cli, "start_run", lambda conn, **kwargs: workflow_run_id)

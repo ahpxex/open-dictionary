@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 from typing import Any
@@ -238,6 +239,27 @@ def build_generation_source_payload(
         ],
         "pos_groups": pos_groups,
     }
+
+
+def build_enrichment_request_payload(
+    entry_payload: dict[str, Any],
+    *,
+    prompt_bundle: PromptBundle,
+) -> dict[str, Any]:
+    return {
+        "entry": build_generation_source_payload(
+            entry_payload,
+            definition_language=prompt_bundle.definition_language,
+        ),
+        "prompt_template_version": prompt_bundle.template_version,
+        "prompt_version": prompt_bundle.resolved_prompt_version,
+        "definition_language": prompt_bundle.definition_language.as_dict(),
+    }
+
+
+def compute_request_hash(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def build_user_prompt(entry_payload: dict[str, Any]) -> str:

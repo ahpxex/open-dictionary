@@ -12,7 +12,7 @@ from open_dictionary.db.connection import get_connection
 from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id, build_prompt_bundle
 from open_dictionary.pipeline import ProgressCallback, ThrottledProgressReporter, complete_run, emit_progress, fail_run, start_run, update_run_config
 from open_dictionary.stages.export_distribution_jsonl.schema import DISTRIBUTION_SCHEMA_VERSION, validate_distribution_document
-from open_dictionary.stages.export_jsonl.stage import ExportJSONLResult, identifier_from_dotted, record_export_artifact, write_jsonl_atomic
+from open_dictionary.stages.export_jsonl.stage import ExportJSONLResult, iter_curated_rows, load_matching_enrichment_candidates, record_export_artifact, select_matching_enrichment, write_jsonl_atomic
 
 
 EXPORT_DISTRIBUTION_JSONL_STAGE = "distribution.export"
@@ -158,104 +158,66 @@ def iter_distribution_records(
     prompt_bundle,
     progress_callback: ProgressCallback | None = None,
 ):
-    curated_identifier = identifier_from_dotted(curated_table)
-    llm_identifier = identifier_from_dotted(llm_table)
-
-    latest_enrichment_sql = sql.SQL(
-        """
-        SELECT DISTINCT ON (entry_id)
-            run_id,
-            entry_id,
-            model,
-            prompt_version,
-            definition_language_code,
-            definition_language_name,
-            response_payload
-        FROM {}
-        WHERE status = 'succeeded'
-          AND prompt_version = %s
-          AND definition_language_code = %s
-        """
-    ).format(llm_identifier)
-
-    params: list[Any] = [
-        prompt_bundle.resolved_prompt_version,
-        prompt_bundle.definition_language.code,
-    ]
-    if model is not None:
-        latest_enrichment_sql += sql.SQL(" AND model = %s")
-        params.append(model)
-    latest_enrichment_sql += sql.SQL(" ORDER BY entry_id, created_at DESC")
-
-    query = sql.SQL(
-        """
-        WITH latest_enrichment AS (
-            {latest_enrichment_sql}
-        )
-        SELECT
-            e.run_id,
-            l.run_id,
-            e.entry_id,
-            e.lang_code,
-            e.normalized_word,
-            e.word,
-            e.payload,
-            l.model,
-            l.prompt_version,
-            l.definition_language_code,
-            l.definition_language_name,
-            l.response_payload
-        FROM {curated_table} AS e
-        JOIN latest_enrichment AS l
-          ON l.entry_id = e.entry_id
-        ORDER BY e.lang_code, e.normalized_word
-        """
-    ).format(
-        latest_enrichment_sql=latest_enrichment_sql,
-        curated_table=curated_identifier,
+    candidates = load_matching_enrichment_candidates(
+        settings=settings,
+        llm_table=llm_table,
+        model=model,
+        prompt_bundle=prompt_bundle,
     )
-
-    with get_connection(settings) as conn:
-        with conn.cursor() as cursor:
-            reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_DISTRIBUTION_JSONL_STAGE)
-            processed = 0
-            exported = 0
-            cursor.execute(query, params)
-            for curated_run_id, llm_run_id, entry_id, _lang_code, _normalized_word, _word, curated_payload, llm_model, llm_prompt_version, llm_definition_language_code, llm_definition_language_name, response_payload in cursor.fetchall():
-                if (
-                    llm_definition_language_code != prompt_bundle.definition_language.code
-                    or (llm_definition_language_name or "").strip() != prompt_bundle.definition_language.name
-                ):
-                    raise ValueError(
-                        "Selected enrichment does not match the requested definition language contract: "
-                        f"expected {prompt_bundle.definition_language.as_dict()}, "
-                        f"got {{'code': {llm_definition_language_code!r}, 'name': {llm_definition_language_name!r}}}"
-                    )
-                document = build_distribution_document(
-                    curated_payload=curated_payload,
-                    llm_payload=response_payload,
-                    definition_language=prompt_bundle.definition_language,
-                )
-                if document is not None:
-                    validate_distribution_document(document)
-                    exported += 1
-                processed += 1
-                reporter.report(
-                    event="export_progress",
-                    processed_entries=processed,
-                    exported_entries=exported,
-                )
-                yield {
-                    "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
-                    "llm_run_id": str(llm_run_id) if llm_run_id is not None else None,
-                    "document": document,
-                }
-            reporter.report(
-                event="export_progress",
-                force=True,
-                processed_entries=processed,
-                exported_entries=exported,
+    reporter = ThrottledProgressReporter(progress_callback, stage=EXPORT_DISTRIBUTION_JSONL_STAGE)
+    processed = 0
+    exported = 0
+    for curated_run_id, entry_id, _lang_code, _normalized_word, _word, curated_payload in iter_curated_rows(
+        settings=settings,
+        curated_table=curated_table,
+    ):
+        current_enrichment = select_matching_enrichment(
+            curated_payload=curated_payload,
+            entry_id=entry_id,
+            prompt_bundle=prompt_bundle,
+            candidates=candidates,
+        )
+        if current_enrichment is None:
+            raise ValueError(
+                "No succeeded enrichment matches the current curated payload for "
+                f"entry_id {entry_id} and prompt_version {prompt_bundle.resolved_prompt_version}"
             )
+        if (
+            current_enrichment["definition_language_code"] != prompt_bundle.definition_language.code
+            or (current_enrichment["definition_language_name"] or "").strip()
+            != prompt_bundle.definition_language.name
+        ):
+            raise ValueError(
+                "Selected enrichment does not match the requested definition language contract: "
+                f"expected {prompt_bundle.definition_language.as_dict()}, "
+                f"got {{'code': {current_enrichment['definition_language_code']!r}, "
+                f"'name': {current_enrichment['definition_language_name']!r}}}"
+            )
+        document = build_distribution_document(
+            curated_payload=curated_payload,
+            llm_payload=current_enrichment["response_payload"],
+            definition_language=prompt_bundle.definition_language,
+        )
+        if document is not None:
+            validate_distribution_document(document)
+            exported += 1
+        processed += 1
+        reporter.report(
+            event="export_progress",
+            processed_entries=processed,
+            exported_entries=exported,
+        )
+        yield {
+            "curated_run_id": str(curated_run_id) if curated_run_id is not None else None,
+            "llm_run_id": current_enrichment["run_id"],
+            "document": document,
+        }
+    reporter.report(
+        event="export_progress",
+        force=True,
+        processed_entries=processed,
+        exported_entries=exported,
+    )
 
 
 def build_distribution_document(

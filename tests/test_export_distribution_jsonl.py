@@ -4,11 +4,13 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from open_dictionary.config.settings import RuntimeSettings
 from open_dictionary.contracts import DEFAULT_DEFINITION_LANGUAGE
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
-from open_dictionary.llm.prompt import PROMPT_VERSION, build_pos_group_id, build_prompt_bundle
+from open_dictionary.llm.prompt import PROMPT_VERSION, build_enrichment_request_payload, build_pos_group_id, build_prompt_bundle, compute_request_hash
 from open_dictionary.pipeline.runs import start_run
 from open_dictionary.stages.export_distribution_jsonl.schema import validate_distribution_document
 from open_dictionary.stages.export_distribution_jsonl import stage as distribution_stage
@@ -158,11 +160,18 @@ def seed_llm_enrichment(
     prompt_version: str = PROMPT_VERSION,
     definition_language: dict | None = None,
     status: str = "succeeded",
+    input_hash: str | None = None,
 ) -> None:
     definition_language = definition_language or DEFAULT_DEFINITION_LANGUAGE.as_dict()
     prompt_bundle = build_prompt_bundle(
         prompt_version=prompt_version,
         definition_language=definition_language,
+    )
+    with conn.cursor() as cursor:
+        cursor.execute("select payload from curated.entries where entry_id = %s", (entry_id,))
+        curated_payload = cursor.fetchone()[0]
+    resolved_input_hash = input_hash or compute_request_hash(
+        build_enrichment_request_payload(curated_payload, prompt_bundle=prompt_bundle)
     )
     run_id = start_run(conn, stage="definitions.generate")
     with conn.cursor() as cursor:
@@ -204,7 +213,7 @@ def seed_llm_enrichment(
                 prompt_bundle.resolved_prompt_version,
                 definition_language["code"],
                 definition_language["name"],
-                f"hash-{entry_id}-{prompt_bundle.resolved_prompt_version}",
+                resolved_input_hash,
                 status,
                 json.dumps(payload or {}),
                 json.dumps(payload or {}),
@@ -489,3 +498,47 @@ def test_run_export_distribution_jsonl_stage_selects_requested_definition_langua
     assert result.entry_count == 1
     assert rows[0]["definition_language"]["code"] == "en"
     assert rows[0]["headword_summary"] == "English overall summary."
+
+
+def test_distribution_export_rejects_stale_enrichment_payloads(
+    temp_database_url: str,
+    tmp_path: Path,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+    output = tmp_path / "distribution.jsonl"
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        entry_id = seed_curated_entry(conn)
+        seed_llm_enrichment(
+            conn,
+            entry_id=entry_id,
+            input_hash="stale-hash",
+            payload={
+                "headword_summary": "整体说明。",
+                "study_notes": ["学习提示。"],
+                "etymology_note": None,
+                "pos_groups": [
+                    {
+                        "pos_group_id": build_pos_group_id(pos="adj", etymology_id="et1"),
+                        "pos": "adj",
+                        "summary": "形容词整体说明。",
+                        "usage_notes": None,
+                        "meanings": [
+                            {
+                                "sense_id": "s1",
+                                "short_gloss": "复杂精密的",
+                                "learner_explanation": "详细解释。",
+                                "usage_note": None,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="No succeeded enrichment matches the current curated payload"):
+        distribution_stage.run_export_distribution_jsonl_stage(
+            settings=settings,
+            output_path=output,
+        )

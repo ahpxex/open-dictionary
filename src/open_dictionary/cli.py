@@ -14,6 +14,7 @@ from .config import load_settings
 from .contracts import DEFAULT_DEFINITION_LANGUAGE, normalize_language_spec
 from .db.bootstrap import LATEST_FOUNDATION_VERSION, apply_foundation
 from .db.connection import get_connection
+from .llm.config import load_llm_settings
 from .llm.prompt import PROMPT_VERSION, build_prompt_bundle
 from .pipeline import complete_run, fail_run, start_run
 from .sources.wiktionary import (
@@ -41,7 +42,7 @@ from .stages.export_jsonl import (
     EXPORT_AUDIT_JSONL_STAGE,
     run_export_audit_jsonl_stage,
 )
-from .stages.llm_enrich import LLM_ENRICH_STAGE, run_llm_enrich_stage
+from .stages.llm_enrich import LLM_ENRICH_STAGE, count_pending_entries, run_llm_enrich_stage
 from .stages.raw_ingest import DEFAULT_RAW_TABLE, RAW_INGEST_STAGE, run_raw_ingest_stage
 
 
@@ -141,43 +142,18 @@ def _count_pending_llm_entries(
     *,
     source_table: str,
     target_table: str,
-    prompt_version: str,
-    definition_language_code: str,
-    model: str | None,
+    prompt_bundle,
+    model: str,
     recompute_existing: bool,
 ) -> int:
-    if recompute_existing:
-        with get_connection(settings) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(_identifier_from_dotted(source_table)))
-                return cursor.fetchone()[0]
-
-    query = sql.SQL(
-        """
-        SELECT count(*)
-        FROM {source_table} AS e
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM {target_table} AS x
-            WHERE x.entry_id = e.entry_id
-              AND x.prompt_version = %s
-              AND x.definition_language_code = %s
-              AND x.status = 'succeeded'
-              {model_filter}
-        )
-        """
-    ).format(
-        source_table=_identifier_from_dotted(source_table),
-        target_table=_identifier_from_dotted(target_table),
-        model_filter=sql.SQL("AND x.model = %s") if model is not None else sql.SQL(""),
+    return count_pending_entries(
+        settings,
+        source_table=source_table,
+        target_table=target_table,
+        prompt_bundle=prompt_bundle,
+        model=model,
+        recompute_existing=recompute_existing,
     )
-    params: list[object] = [prompt_version, definition_language_code]
-    if model is not None:
-        params.append(model)
-    with get_connection(settings) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params)
-            return cursor.fetchone()[0]
 
 
 def _fetch_recent_failed_enrichments(
@@ -424,6 +400,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
     audit_result = None
 
     try:
+        export_model = args.model or load_llm_settings(env_file=model_env_file).model
         if not args.skip_init_db:
             with get_connection(settings) as conn:
                 apply_foundation(conn)
@@ -531,9 +508,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 settings,
                 source_table=args.curated_table,
                 target_table=args.llm_table,
-                prompt_version=prompt_bundle.resolved_prompt_version,
-                definition_language_code=definition_language.code,
-                model=args.model,
+                prompt_bundle=prompt_bundle,
+                model=export_model,
                 recompute_existing=args.recompute_existing,
             )
             for workers in worker_tiers:
@@ -566,9 +542,8 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                     settings,
                     source_table=args.curated_table,
                     target_table=args.llm_table,
-                    prompt_version=prompt_bundle.resolved_prompt_version,
-                    definition_language_code=definition_language.code,
-                    model=args.model,
+                    prompt_bundle=prompt_bundle,
+                    model=export_model,
                     recompute_existing=args.recompute_existing,
                 )
                 llm_attempts.append(
@@ -594,7 +569,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                     target_table=args.llm_table,
                     prompt_version=prompt_bundle.resolved_prompt_version,
                     definition_language_code=definition_language.code,
-                    model=args.model,
+                    model=export_model,
                     limit=10,
                 )
                 raise RuntimeError(
@@ -611,7 +586,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 curated_table=args.curated_table,
                 llm_table=args.llm_table,
                 artifact_table=args.artifact_table,
-                model=args.model,
+                model=export_model,
                 prompt_version=args.prompt_version,
                 definition_language=definition_language,
                 parent_run_id=workflow_run_id,
@@ -634,7 +609,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 curated_table=args.curated_table,
                 llm_table=args.llm_table,
                 artifact_table=args.artifact_table,
-                model=args.model,
+                model=export_model,
                 prompt_version=args.prompt_version,
                 definition_language=definition_language,
                 parent_run_id=workflow_run_id,
@@ -648,7 +623,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
                 curated_table=args.curated_table,
                 llm_table=args.llm_table,
                 artifact_table=args.artifact_table,
-                model=args.model,
+                model=export_model,
                 prompt_version=args.prompt_version,
                 definition_language=definition_language,
                 include_unenriched=args.include_unenriched_audit,
