@@ -6,6 +6,7 @@ from uuid import uuid4
 from open_dictionary.config.settings import RuntimeSettings
 from open_dictionary.db.bootstrap import apply_foundation
 from open_dictionary.db.connection import get_connection
+from open_dictionary.stages.curated_build import stage as curated_stage_module
 from open_dictionary.stages.curated_build.stage import run_curated_build_stage
 from open_dictionary.stages.raw_ingest.stage import run_raw_ingest_stage
 
@@ -226,3 +227,37 @@ def test_curated_build_stage_rerun_does_not_duplicate_group_triage(
     assert first.triage_written == 1
     assert second.triage_written == 1
     assert triage_count == 1
+
+
+def test_curated_build_stage_batches_writes_without_losing_results(
+    temp_database_url: str,
+    monkeypatch,
+) -> None:
+    settings = RuntimeSettings(database_url=temp_database_url)
+
+    with get_connection(settings) as conn:
+        apply_foundation(conn)
+        insert_raw_row(conn, word="alpha", lang="English", lang_code="en", pos="noun", source_line=1, gloss="alpha")
+        insert_raw_row(conn, word="beta", lang="English", lang_code="en", pos="noun", source_line=2, gloss="beta")
+        insert_raw_row(conn, word="倦", lang="Japanese", lang_code="ja", pos="character", source_line=3, gloss="in fatigue")
+        conn.commit()
+
+    monkeypatch.setattr(curated_stage_module, "DEFAULT_PERSIST_BATCH_SIZE", 2)
+
+    first = run_curated_build_stage(settings=settings)
+    second = run_curated_build_stage(settings=settings)
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("select count(*) from curated.entries")
+            entry_count = cursor.fetchone()[0]
+            cursor.execute("select count(*) from curated.triage_queue")
+            triage_count = cursor.fetchone()[0]
+            cursor.execute("select array_agg(word order by word) from curated.entries")
+            words = cursor.fetchone()[0]
+
+    assert first.groups_processed == 3
+    assert second.groups_processed == 3
+    assert entry_count == 2
+    assert triage_count == 1
+    assert words == ["alpha", "beta"]

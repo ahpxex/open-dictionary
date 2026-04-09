@@ -19,6 +19,7 @@ DEFAULT_RAW_SOURCE_TABLE = "raw.wiktionary_entries"
 DEFAULT_CURATED_TABLE = "curated.entries"
 DEFAULT_RELATIONS_TABLE = "curated.entry_relations"
 DEFAULT_TRIAGE_TABLE = "curated.triage_queue"
+DEFAULT_PERSIST_BATCH_SIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,11 @@ def run_curated_build_stage(
     entries_written = 0
     relations_written = 0
     triage_written = 0
+    pending_outputs: list[CuratedBuildOutput] = []
+    pending_groups = 0
+    pending_entries = 0
+    pending_relations = 0
+    pending_triage = 0
 
     try:
         with get_connection(settings) as conn:
@@ -90,6 +96,48 @@ def run_curated_build_stage(
             current_rows: list[dict[str, Any]] = []
             current_key: tuple[str, str] | None = None
 
+            def flush_pending_outputs(*, force: bool = False) -> None:
+                nonlocal groups_processed
+                nonlocal entries_written
+                nonlocal relations_written
+                nonlocal triage_written
+                nonlocal pending_groups
+                nonlocal pending_entries
+                nonlocal pending_relations
+                nonlocal pending_triage
+
+                if not pending_outputs:
+                    return
+
+                persist_curated_outputs(
+                    conn,
+                    run_id=run_id,
+                    outputs=pending_outputs,
+                    target_table=target_table,
+                    relations_table=relations_table,
+                    triage_table=triage_table,
+                )
+
+                groups_processed += pending_groups
+                entries_written += pending_entries
+                relations_written += pending_relations
+                triage_written += pending_triage
+
+                pending_outputs.clear()
+                pending_groups = 0
+                pending_entries = 0
+                pending_relations = 0
+                pending_triage = 0
+
+                reporter.report(
+                    event="build_progress",
+                    force=force,
+                    groups_processed=groups_processed,
+                    entries_written=entries_written,
+                    relations_written=relations_written,
+                    triage_written=triage_written,
+                )
+
             for raw_row in iter_groupable_rows(conn, source_table=source_table, lang_codes=lang_codes):
                 next_key = (
                     str(raw_row.get("lang_code") or "_"),
@@ -98,26 +146,22 @@ def run_curated_build_stage(
                 if current_key is None:
                     current_key = next_key
                 if next_key != current_key:
-                    groups_processed += 1
                     output = build_curated_entry(current_rows)
-                    entries_written += persist_curated_output(
-                        conn,
-                        run_id=run_id,
-                        output=output,
-                        target_table=target_table,
-                        relations_table=relations_table,
-                        triage_table=triage_table,
-                    )
-                    relations_written += len(output.relations)
-                    triage_written += len(output.triage_items)
+                    pending_outputs.append(output)
+                    pending_groups += 1
+                    pending_entries += 1 if output.entry is not None else 0
+                    pending_relations += len(output.relations)
+                    pending_triage += len(output.triage_items)
+                    if len(pending_outputs) >= DEFAULT_PERSIST_BATCH_SIZE:
+                        flush_pending_outputs()
                     reporter.report(
                         event="build_progress",
-                        groups_processed=groups_processed,
-                        entries_written=entries_written,
-                        relations_written=relations_written,
-                        triage_written=triage_written,
+                        groups_processed=groups_processed + pending_groups,
+                        entries_written=entries_written + pending_entries,
+                        relations_written=relations_written + pending_relations,
+                        triage_written=triage_written + pending_triage,
                     )
-                    if limit_groups is not None and groups_processed >= limit_groups:
+                    if limit_groups is not None and (groups_processed + pending_groups) >= limit_groups:
                         current_rows = []
                         current_key = next_key
                         break
@@ -127,26 +171,14 @@ def run_curated_build_stage(
                     current_rows.append(raw_row)
 
             if current_rows and (limit_groups is None or groups_processed < limit_groups):
-                groups_processed += 1
                 output = build_curated_entry(current_rows)
-                entries_written += persist_curated_output(
-                    conn,
-                    run_id=run_id,
-                    output=output,
-                    target_table=target_table,
-                    relations_table=relations_table,
-                    triage_table=triage_table,
-                )
-                relations_written += len(output.relations)
-                triage_written += len(output.triage_items)
-                reporter.report(
-                    event="build_progress",
-                    force=True,
-                    groups_processed=groups_processed,
-                    entries_written=entries_written,
-                    relations_written=relations_written,
-                    triage_written=triage_written,
-                )
+                pending_outputs.append(output)
+                pending_groups += 1
+                pending_entries += 1 if output.entry is not None else 0
+                pending_relations += len(output.relations)
+                pending_triage += len(output.triage_items)
+
+            flush_pending_outputs(force=True)
 
             complete_run(
                 conn,
@@ -225,35 +257,72 @@ def persist_curated_output(
     relations_table: str,
     triage_table: str,
 ) -> int:
-    clear_group_triage(
+    persist_curated_outputs(
         conn,
+        run_id=run_id,
+        outputs=[output],
+        target_table=target_table,
+        relations_table=relations_table,
         triage_table=triage_table,
-        output=output,
     )
-    if output.entry is not None:
-        upsert_entry(conn, target_table=target_table, run_id=run_id, entry=output.entry)
-        replace_relations(
-            conn,
-            relations_table=relations_table,
-            run_id=run_id,
-            entry_id=output.entry["entry_id"],
-            relations=output.relations,
-        )
-    for triage_item in output.triage_items:
-        insert_triage_item(conn, triage_table=triage_table, run_id=run_id, item=triage_item)
-    conn.commit()
     return 1 if output.entry is not None else 0
 
 
-def clear_group_triage(conn, *, triage_table: str, output: CuratedBuildOutput) -> None:
-    lang_code, word = triage_group_identity(output)
-    if not lang_code or not word:
+def persist_curated_outputs(
+    conn,
+    *,
+    run_id: UUID,
+    outputs: list[CuratedBuildOutput],
+    target_table: str,
+    relations_table: str,
+    triage_table: str,
+) -> None:
+    if not outputs:
         return
+
+    clear_group_triage_batch(conn, triage_table=triage_table, outputs=outputs)
+
+    entries = [output.entry for output in outputs if output.entry is not None]
+    if entries:
+        upsert_entries(conn, target_table=target_table, run_id=run_id, entries=entries)
+        replace_relations_batch(conn, relations_table=relations_table, run_id=run_id, outputs=outputs)
+
+    triage_items = [item for output in outputs for item in output.triage_items]
+    if triage_items:
+        insert_triage_items(conn, triage_table=triage_table, run_id=run_id, items=triage_items)
+
+    conn.commit()
+
+
+def clear_group_triage_batch(conn, *, triage_table: str, outputs: list[CuratedBuildOutput]) -> None:
+    identities = sorted(
+        {
+            (lang_code, word)
+            for output in outputs
+            for lang_code, word in [triage_group_identity(output)]
+            if lang_code and word
+        }
+    )
+    if not identities:
+        return
+
     table_identifier = _identifier_from_dotted(triage_table)
+    values_sql = sql.SQL(", ").join(sql.SQL("(%s, %s)") for _ in identities)
+    params: list[Any] = []
+    for lang_code, word in identities:
+        params.extend((lang_code, word))
+
     with conn.cursor() as cursor:
         cursor.execute(
-            sql.SQL("DELETE FROM {} WHERE lang_code = %s AND word = %s").format(table_identifier),
-            (lang_code, word),
+            sql.SQL(
+                """
+                DELETE FROM {} AS triage
+                USING (VALUES {}) AS doomed(lang_code, word)
+                WHERE triage.lang_code = doomed.lang_code
+                  AND triage.word = doomed.word
+                """
+            ).format(table_identifier, values_sql),
+            params,
         )
 
 
@@ -265,8 +334,12 @@ def triage_group_identity(output: CuratedBuildOutput) -> tuple[str | None, str |
     return None, None
 
 
-def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]) -> None:
+def upsert_entries(conn, *, target_table: str, run_id: UUID, entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        return
+
     table_identifier = _identifier_from_dotted(target_table)
+    values_sql = sql.SQL(", ").join(sql.SQL("(%s, %s, %s, %s, %s, %s, %s, %s)") for _ in entries)
     query = sql.SQL(
         """
         INSERT INTO {} (
@@ -278,7 +351,7 @@ def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]
             payload,
             entry_flags,
             source_summary
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES {}
         ON CONFLICT (entry_id)
         DO UPDATE SET
             run_id = EXCLUDED.run_id,
@@ -290,11 +363,11 @@ def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]
             source_summary = EXCLUDED.source_summary,
             updated_at = NOW()
         """
-    ).format(table_identifier)
+    ).format(table_identifier, values_sql)
 
-    with conn.cursor() as cursor:
-        cursor.execute(
-            query,
+    params: list[Any] = []
+    for entry in entries:
+        params.extend(
             (
                 run_id,
                 entry["entry_id"],
@@ -304,23 +377,47 @@ def upsert_entry(conn, *, target_table: str, run_id: UUID, entry: dict[str, Any]
                 Jsonb(entry),
                 entry["entry_flags"],
                 Jsonb(entry["source_summary"]),
-            ),
+            )
         )
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
 
 
-def replace_relations(
+def replace_relations_batch(
     conn,
     *,
     relations_table: str,
     run_id: UUID,
-    entry_id: str,
-    relations: list[dict[str, Any]],
+    outputs: list[CuratedBuildOutput],
 ) -> None:
+    entry_ids = sorted(
+        {
+            output.entry["entry_id"]
+            for output in outputs
+            if output.entry is not None
+        }
+    )
+    if not entry_ids:
+        return
+
     table_identifier = _identifier_from_dotted(relations_table)
     with conn.cursor() as cursor:
-        cursor.execute(sql.SQL("DELETE FROM {} WHERE entry_id = %s").format(table_identifier), (entry_id,))
+        delete_values_sql = sql.SQL(", ").join(sql.SQL("(%s::uuid)") for _ in entry_ids)
+        cursor.execute(
+            sql.SQL(
+                """
+                DELETE FROM {} AS relations
+                USING (VALUES {}) AS doomed(entry_id)
+                WHERE relations.entry_id = doomed.entry_id
+                """
+            ).format(table_identifier, delete_values_sql),
+            entry_ids,
+        )
+
+        relations = [relation for output in outputs for relation in output.relations]
         if not relations:
             return
+
         values_sql = sql.SQL(", ").join(
             sql.SQL("(%s::uuid, %s::uuid, %s::text, %s::text, %s::text, %s::text, %s::jsonb)")
             for _ in relations
@@ -343,7 +440,7 @@ def replace_relations(
             params.extend(
                 (
                     run_id,
-                    entry_id,
+                    relation["entry_id"],
                     relation["relation_type"],
                     relation["target_word"],
                     relation.get("target_lang_code"),
@@ -354,8 +451,12 @@ def replace_relations(
         cursor.execute(query, params)
 
 
-def insert_triage_item(conn, *, triage_table: str, run_id: UUID, item: TriageItem) -> None:
+def insert_triage_items(conn, *, triage_table: str, run_id: UUID, items: list[TriageItem]) -> None:
+    if not items:
+        return
+
     table_identifier = _identifier_from_dotted(triage_table)
+    values_sql = sql.SQL(", ").join(sql.SQL("(%s, %s, %s, %s, %s, %s, %s, %s)") for _ in items)
     query = sql.SQL(
         """
         INSERT INTO {} (
@@ -367,12 +468,13 @@ def insert_triage_item(conn, *, triage_table: str, run_id: UUID, item: TriageIte
             suggested_action,
             raw_record_refs,
             payload
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES {}
         """
-    ).format(table_identifier)
-    with conn.cursor() as cursor:
-        cursor.execute(
-            query,
+    ).format(table_identifier, values_sql)
+
+    params: list[Any] = []
+    for item in items:
+        params.extend(
             (
                 run_id,
                 item.lang_code,
@@ -382,8 +484,11 @@ def insert_triage_item(conn, *, triage_table: str, run_id: UUID, item: TriageIte
                 item.suggested_action,
                 Jsonb(item.raw_record_refs),
                 Jsonb(item.payload),
-            ),
+            )
         )
+
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
 
 
 def _reset_outputs(conn, *, target_table: str, relations_table: str, triage_table: str) -> None:

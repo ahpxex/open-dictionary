@@ -326,6 +326,23 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
             """,
         ),
     ),
+    Migration(
+        version="20260409_curated_build_perf_v4",
+        statements=(
+            """
+            CREATE INDEX IF NOT EXISTS raw_wiktionary_entries_grouping_idx
+            ON raw.wiktionary_entries (
+                lang_code,
+                (lower(coalesce(word, payload->>'word', ''))),
+                id
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS curated_triage_queue_lang_word_idx
+            ON curated.triage_queue (lang_code, word)
+            """,
+        ),
+    ),
 )
 
 
